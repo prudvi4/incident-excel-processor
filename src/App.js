@@ -295,33 +295,82 @@ export default function IncidentExcelProcessor() {
   }
 
   // Build Excel workbook with real Date cells for date columns
-  function buildWorkbookWithDates(headers, rows) {
-    // Build AOa: first row headers, then each row values. For date headers, convert strings to Date objects.
-    const dateColumns = headers.filter(h => /Opened|Updated/i.test(h));
+ function buildWorkbookWithDates(headers, rows) {
+  const dateColumns = headers.filter(h => /Opened|Updated/i.test(h));
 
-    const aoa = [headers];
-    for (const r of rows) {
-      const row = headers.map(h => {
-        const v = r[h];
-        if (v == null || v === '') return '';
-        if (dateColumns.includes(h)) {
-          const d = parseToDate(v);
-          if (d) return d; // Date object — xlsx will write as date cell
-          // sometimes v is ISO string; parseToDate handles it
-        }
-        // keep intervals & other columns as strings
-        return v;
-      });
-      aoa.push(row);
+  // Build AOa: first row headers, then each row values. For date headers, convert strings to Date objects.
+  const aoa = [headers];
+  for (const r of rows) {
+    const row = headers.map(h => {
+      const v = r[h];
+      if (v == null || v === '') return '';
+      if (dateColumns.includes(h)) {
+        const d = parseToDate(v);
+        if (d) return d; // Date object — xlsx will write as a date cell
+      }
+      return v;
+    });
+    aoa.push(row);
+  }
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  // AUTO-FIT COLUMN WIDTHS (based on max text length per column, with caps and padding)
+  const MAX_WCH = 50;      // prevent extremely wide columns
+  const DATE_WCH = 20;     // typical width for "dd-mm-yyyy hh:mm AM/PM"
+  ws['!cols'] = headers.map((h, colIdx) => {
+    // Start with header length
+    let maxLen = String(h || '').length;
+
+    // Check each row value in this column
+    for (let r = 1; r < aoa.length; r++) {
+      const cellValue = aoa[r][colIdx] != null ? aoa[r][colIdx] : '';
+      // If it's a Date object, use DATE_WCH
+      if (cellValue instanceof Date) {
+        maxLen = Math.max(maxLen, DATE_WCH);
+        continue;
+      }
+      const txt = String(cellValue);
+      // consider multi-byte chars roughly as length (simple)
+      if (txt.length > maxLen) maxLen = txt.length;
     }
 
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    // Adjust column widths lightly
-    ws['!cols'] = headers.map(() => ({ wch: 18 }));
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Processed');
-    return wb;
+    // Add small padding
+    let wch = Math.min(MAX_WCH, maxLen + 2);
+
+    // If date column, ensure minimum width
+    if (dateColumns.includes(h)) wch = Math.max(wch, DATE_WCH);
+
+    return { wch };
+  });
+
+  // *** APPLY TIMESTAMP FORMAT TO DATE CELLS ***
+  // Note: when aoa_to_sheet writes Date objects, cell.t can be 'd' or 'n' depending on options.
+  // We'll check for both and set formatting string for time display.
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  for (let R = 1; R <= range.e.r; R++) {
+    for (let C = 0; C <= range.e.c; C++) {
+      const header = headers[C];
+      if (!dateColumns.includes(header)) continue;
+
+      const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
+      const cell = ws[cellAddress];
+
+      if (cell && (cell.t === 'n' || cell.t === 'd')) {
+        // Excel timestamp format with AM/PM (day-month-year style)
+        // You can change to "mm-dd-yyyy hh:mm AM/PM" if you prefer US style.
+        cell.z = "dd-mm-yyyy hh:mm AM/PM";
+      }
+    }
   }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Processed');
+
+  return wb;
+}
+
+
 
   async function handleDownload() {
     if (!fileValid || !inputFile) return;
