@@ -2,7 +2,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 
-// Incident Excel Processor - full component
+// Incident Excel Processor - SLA columns + final "Within SLA" + Compliance sheet
 export default function IncidentExcelProcessor(props) {
   const [fileName, setFileName] = useState(null);
   const [fileValid, setFileValid] = useState(false);
@@ -12,14 +12,14 @@ export default function IncidentExcelProcessor(props) {
 
   // preview & data
   const [allHeaders, setAllHeaders] = useState([]);
-  const [allRows, setAllRows] = useState([]); // full processed rows (array of objects)
+  const [allRows, setAllRows] = useState([]); // processed rows (array of objects)
   const [totalRowsCount, setTotalRowsCount] = useState(0);
 
   // Table UI states
   const [globalFilter, setGlobalFilter] = useState('');
   const [columnFilters, setColumnFilters] = useState({});
   const [sortKey, setSortKey] = useState(null);
-  const [sortDir, setSortDir] = useState('asc'); // 'asc' | 'desc'
+  const [sortDir, setSortDir] = useState('asc');
 
   // Pagination
   const [pageSize, setPageSize] = useState(25);
@@ -30,11 +30,10 @@ export default function IncidentExcelProcessor(props) {
   const [showConfirmClear, setShowConfirmClear] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
 
-  // Debounce timer refs
+  // Debounce refs
   const globalFilterTimer = useRef(null);
   const columnFilterTimers = useRef({});
 
-  // keyboard shortcut (Ctrl+K to clear)
   useEffect(() => {
     const onKey = (e) => {
       const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
@@ -54,18 +53,6 @@ export default function IncidentExcelProcessor(props) {
     return fn.toLowerCase().endsWith('.xlsx');
   }
 
-  function resetAllState(withAnimation = true) {
-    if (withAnimation) {
-      setIsFadingOut(true);
-      // allow animation to play then clear
-      setTimeout(() => {
-        _clearState();
-        setIsFadingOut(false);
-      }, 350);
-    } else {
-      _clearState();
-    }
-  }
   function _clearState() {
     setFileName(null);
     setFileValid(false);
@@ -84,9 +71,20 @@ export default function IncidentExcelProcessor(props) {
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
+  function resetAllState(withAnimation = true) {
+    if (withAnimation) {
+      setIsFadingOut(true);
+      setTimeout(() => {
+        _clearState();
+        setIsFadingOut(false);
+      }, 350);
+    } else {
+      _clearState();
+    }
+  }
+
   function handleFileChange(e) {
     const file = e.target.files[0];
-    // reset preview state but not animate here
     _clearState();
     if (!file) {
       setMessage('No file selected');
@@ -103,11 +101,8 @@ export default function IncidentExcelProcessor(props) {
   }
 
   // --- Date helpers ---
-
-  // timezone-safe conversion of Excel serial -> Date that preserves the date/time components
   function excelSerialToDate(serial) {
     if (typeof serial !== 'number') return null;
-    // convert serial to UTC milliseconds, then reconstruct a local Date with the same Y/M/D/H/M/S components
     const utcMs = (serial - 25569) * 86400 * 1000;
     const d = new Date(utcMs);
     return new Date(
@@ -131,7 +126,7 @@ export default function IncidentExcelProcessor(props) {
     const s = String(val).trim();
     const p = Date.parse(s);
     if (!isNaN(p)) return new Date(p);
-    // custom dd/mm/yyyy hh:mm[:ss] AM/PM regex
+    // dd/mm/yyyy hh:mm[:ss] AM/PM
     const re = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})[ ,T](\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?$/;
     const m = s.match(re);
     if (m) {
@@ -161,6 +156,14 @@ export default function IncidentExcelProcessor(props) {
     const min = String(dt.getMinutes()).padStart(2, '0');
     const ss = String(dt.getSeconds()).padStart(2, '0');
     return `${y}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  }
+
+  function formatShortDate(dt) {
+    if (!dt || isNaN(dt)) return '';
+    const y = dt.getFullYear();
+    const mm = String(dt.getMonth() + 1).padStart(2, '0');
+    const dd = String(dt.getDate()).padStart(2, '0');
+    return `${dd}-${mm}-${y}`;
   }
 
   function formatInterval(ms) {
@@ -194,17 +197,36 @@ export default function IncidentExcelProcessor(props) {
   function parseWorkbook(workbook) {
     const firstSheetName = workbook.SheetNames[0];
     const ws = workbook.Sheets[firstSheetName];
-    // raw:true keeps original cell values while cellDates:true (in read) helps with actual Date objects
     const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: true });
     return { rows, sheet: ws };
   }
 
-  // ---- UPDATED processRows: interleaved Updated + Interval columns ----
+  // SLA threshold map (ms)
+  function priorityThresholdMs(priorityString) {
+    if (!priorityString || typeof priorityString !== 'string') return 8 * 3600 * 1000;
+    const p = priorityString.trim().toUpperCase();
+    if (p.startsWith('P1')) return 1 * 3600 * 1000;
+    if (p.startsWith('P2')) return 3 * 3600 * 1000;
+    if (p.startsWith('P3')) return 4 * 3600 * 1000;
+    if (p.startsWith('P4')) return 8 * 3600 * 1000;
+    const m = p.match(/^P(\d)/);
+    if (m) {
+      const n = Number(m[1]);
+      if (n === 1) return 1 * 3600 * 1000;
+      if (n === 2) return 3 * 3600 * 1000;
+      if (n === 3) return 4 * 3600 * 1000;
+      if (n === 4) return 8 * 3600 * 1000;
+    }
+    return 8 * 3600 * 1000;
+  }
+
+  // MAIN: processRows builds headers + rows; SLA columns use stable keys like "Interval 1 SLA"
   function processRows(rows) {
     if (!rows || rows.length === 0) return { headers: [], data: [] };
     const allKeys = Object.keys(rows[0]);
     const keyNumber = normalizeKey(allKeys, 'Number') || 'Number';
     const keyPriority = normalizeKey(allKeys, 'Priority') || 'Priority';
+    const keyState = normalizeKey(allKeys, 'State') || 'State';
     const keyOpened = normalizeKey(allKeys, 'Opened') || 'Opened';
     const keyUpdated = normalizeKey(allKeys, 'Updated') || 'Updated';
 
@@ -212,7 +234,7 @@ export default function IncidentExcelProcessor(props) {
     for (const r of rows) {
       const num = (r[keyNumber] || '').toString().trim();
       if (!num) continue;
-      if (!groups[num]) groups[num] = { priority: r[keyPriority] || '', openedCandidates: [], updatedCandidates: [] };
+      if (!groups[num]) groups[num] = { priority: r[keyPriority] || '', state: r[keyState] || '', openedCandidates: [], updatedCandidates: [] };
       const openedCell = r[keyOpened];
       if (openedCell !== undefined && openedCell !== null && openedCell !== '') groups[num].openedCandidates.push(openedCell);
       const updCell = r[keyUpdated];
@@ -244,35 +266,74 @@ export default function IncidentExcelProcessor(props) {
         });
       const updatesRaw = parsedUpdates.map(p => ({ raw: p.raw, date: p.d }));
       if (updatesRaw.length > maxUpdates) maxUpdates = updatesRaw.length;
-      outRows.push({ number: num, priority: info.priority, openedDate, updates: updatesRaw });
+      outRows.push({ number: num, priority: info.priority, state: info.state, openedDate, updates: updatesRaw });
     }
 
-    // Build headers interleaved: Number, Priority, Opened, 1st Updated, Interval 1, 2nd Updated, Interval 2, ...
-    const headers = ['Number', 'Priority', 'Opened Date TimeStamp'];
+    // Build headers: stable SLA keys (Interval X SLA). Add final "Within SLA"
+    const headers = ['Number', 'Priority', 'State', 'Opened Date TimeStamp'];
     for (let i = 0; i < maxUpdates; i++) {
-      headers.push(`${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`);
-      if (i === 0) headers.push(`Interval 1 (Opened to 1st Updated)`);
-      else headers.push(`Interval ${i + 1} (${i}th Updated to ${i + 1}th Updated)`);
+      const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`;
+      const intervalCol = `Interval ${i + 1} (Opened->Updated)`;
+      const slaCol = `Interval ${i + 1} SLA`;
+      headers.push(updCol, intervalCol, slaCol);
     }
+    headers.push('Within SLA'); // final aggregate column
 
+    // Build data rows
     const data = outRows.map(r => {
-      const row = { Number: r.number, Priority: r.priority, 'Opened Date TimeStamp': r.openedDate ? formatIso(r.openedDate) : '' };
+      const row = {
+        Number: r.number,
+        Priority: r.priority,
+        State: r.state,
+        'Opened Date TimeStamp': r.openedDate ? formatIso(r.openedDate) : ''
+      };
+
+      const thrMs = priorityThresholdMs(r.priority);
+      const slaValues = []; // collect 'Y'/'N' for each interval
+
       for (let i = 0; i < maxUpdates; i++) {
         const upd = r.updates[i];
-        row[`${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`] = upd && upd.date ? formatIso(upd.date) : (upd ? String(upd.raw) : '');
+        const updDate = upd && upd.date ? upd.date : null;
+        const updText = upd && upd.date ? formatIso(upd.date) : (upd ? String(upd.raw) : '');
+        const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`;
+        const intervalCol = `Interval ${i + 1} (Opened->Updated)`;
+        const slaCol = `Interval ${i + 1} SLA`;
+
+        row[updCol] = updText;
+
         const prevDate = i === 0 ? r.openedDate : (r.updates[i - 1] ? r.updates[i - 1].date : null);
-        const currDate = r.updates[i] ? r.updates[i].date : null;
-        const key = i === 0 ? `Interval 1 (Opened to 1st Updated)` : `Interval ${i + 1} (${i}th Updated to ${i + 1}th Updated)`;
-        if (prevDate && currDate) row[key] = formatInterval(currDate - prevDate);
-        else row[key] = '';
+        const currDate = updDate;
+
+        if (prevDate && currDate) {
+          const diffMs = currDate - prevDate;
+          row[intervalCol] = formatInterval(diffMs);
+          const slaVal = diffMs <= thrMs ? 'Y' : 'N';
+          row[slaCol] = slaVal;
+          slaValues.push(slaVal);
+        } else {
+          row[intervalCol] = '';
+          row[slaCol] = '';
+        }
       }
+
+      // compute final Within SLA:
+      if (slaValues.length === 0) {
+        row['Within SLA'] = '';
+      } else if (slaValues.every(v => v === 'Y')) {
+        row['Within SLA'] = 'Y';
+      } else if (slaValues.some(v => v === 'N')) {
+        row['Within SLA'] = 'N';
+      } else {
+        row['Within SLA'] = '';
+      }
+
       return row;
     });
 
     return { headers, data };
   }
 
-  // ---- handleGenerate: read with cellDates:true ----
+  // GENERATE PREVIEW
   async function handleGenerate() {
     if (!fileValid || !inputFile) return;
     setProcessing(true);
@@ -282,7 +343,6 @@ export default function IncidentExcelProcessor(props) {
     reader.onload = (ev) => {
       try {
         const data = ev.target.result;
-        // important: ask SheetJS to return Date objects where possible
         const workbook = XLSX.read(data, { type: 'array', cellDates: true });
         const { rows } = parseWorkbook(workbook);
         const { headers, data: outData } = processRows(rows);
@@ -308,11 +368,11 @@ export default function IncidentExcelProcessor(props) {
     reader.readAsArrayBuffer(inputFile);
   }
 
-  // Build Excel workbook with real Date cells for date columns (with auto-fit & timestamp format)
-  function buildWorkbookWithDates(headers, rows) {
+  // Build workbook for download: Incident Intervals + Compliance sheet (no raw sheet)
+  function buildWorkbookWithDates(headers, rows, rawRows) {
     const dateColumns = headers.filter(h => /Opened|Updated/i.test(h));
 
-    // Build AOA
+    // AOA for Incident Intervals
     const aoa = [headers];
     for (const r of rows) {
       const row = headers.map(h => {
@@ -326,13 +386,12 @@ export default function IncidentExcelProcessor(props) {
       });
       aoa.push(row);
     }
+    const wsMain = XLSX.utils.aoa_to_sheet(aoa);
 
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-
-    // AUTO-FIT COLUMN WIDTHS
+    // Auto-fit columns for main sheet
     const MAX_WCH = 50;
     const DATE_WCH = 20;
-    ws['!cols'] = headers.map((h, colIdx) => {
+    wsMain['!cols'] = headers.map((h, colIdx) => {
       let maxLen = String(h || '').length;
       for (let r = 1; r < aoa.length; r++) {
         const cellValue = aoa[r][colIdx] != null ? aoa[r][colIdx] : '';
@@ -348,28 +407,120 @@ export default function IncidentExcelProcessor(props) {
       return { wch };
     });
 
-    // APPLY TIMESTAMP FORMAT TO DATE CELLS
-    if (ws['!ref']) {
-      const range = XLSX.utils.decode_range(ws['!ref']);
+    // Apply timestamp format to date cells
+    if (wsMain['!ref']) {
+      const range = XLSX.utils.decode_range(wsMain['!ref']);
       for (let R = 1; R <= range.e.r; R++) {
         for (let C = 0; C <= range.e.c; C++) {
           const header = headers[C];
           if (!dateColumns.includes(header)) continue;
           const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
-          const cell = ws[cellAddress];
+          const cell = wsMain[cellAddress];
           if (cell && (cell.t === 'n' || cell.t === 'd')) {
-            cell.z = "dd-mm-yyyy hh:mm AM/PM"; // change format if you prefer mm-dd-yyyy
+            cell.z = "dd-mm-yyyy hh:mm AM/PM";
           }
         }
       }
     }
 
+    // Build Compliance & Credit sheet (metrics)
+    let minDate = null;
+    let maxDate = null;
+    if (Array.isArray(rawRows)) {
+      for (const r of rawRows) {
+        for (const k of Object.keys(r)) {
+          const v = r[k];
+          const d = parseToDate(v);
+          if (d) {
+            if (!minDate || d < minDate) minDate = d;
+            if (!maxDate || d > maxDate) maxDate = d;
+          }
+        }
+      }
+    }
+
+    // Priorities list and counters
+    const priorities = ['P1 - Critical', 'P2 - High', 'P3 - Medium', 'P4 - Low'];
+    const countsByPriority = {};
+    for (const p of priorities) countsByPriority[p] = { Y: 0, N: 0, total: 0 };
+
+    for (const r of rows) {
+      const pr = (r['Priority'] || '').toString().trim();
+      // match based on starting P1/P2/P3/P4 portion
+      const key = priorities.find(pp => pr.toUpperCase().startsWith(pp.split(' ')[0].toUpperCase()));
+      if (key) {
+        countsByPriority[key].total++;
+        const within = String(r['Within SLA'] || '').trim().toUpperCase();
+        if (within === 'Y') countsByPriority[key].Y++;
+        else if (within === 'N') countsByPriority[key].N++;
+      }
+    }
+
+    // Build Compliance AOA with requested column names:
+    // Priority/SLA | Within SLA | Percentage for Within SLA | Exceeding SLA | Percentage for Exceeding SLA | Total Incidents According to the Priority | Compliance and Credit
+    const compAOA = [];
+    // optional title row (left blank or show range) — but sheet name must be "Compliance and Credit", user asked no date in sheet name
+    const titleText = minDate && maxDate ? `Compliance and Credit - ${formatShortDate(minDate)} to ${formatShortDate(maxDate)}` : 'Compliance and Credit';
+    compAOA.push([titleText]);
+    compAOA.push([
+      'Priority/SLA',
+      'Within SLA',
+      'Percentage for Within SLA',
+      'Exceeding SLA',
+      'Percentage for Exceeding SLA',
+      'Total Incidents According to the Priority',
+      'Compliance and Credit'
+    ]);
+
+    for (const p of priorities) {
+      const { Y, N, total } = countsByPriority[p];
+      const pctWithin = total === 0 ? '' : `${((Y / total) * 100).toFixed(1)}%`;
+      const pctExceed = total === 0 ? '' : `${((N / total) * 100).toFixed(1)}%`;
+      const flag = total === 0 ? '' : ( ((Y / total) * 100) >= 95 ? 'Y' : 'N' );
+      compAOA.push([p, Y, pctWithin, N, pctExceed, total, flag]);
+    }
+
+    const totals = priorities.reduce((acc, p) => {
+      acc.Y += countsByPriority[p].Y;
+      acc.N += countsByPriority[p].N;
+      acc.total += countsByPriority[p].total;
+      return acc;
+    }, { Y: 0, N: 0, total: 0 });
+
+    const overallPctWithin = totals.total === 0 ? '' : `${((totals.Y / totals.total) * 100).toFixed(1)}%`;
+    const overallPctExceed = totals.total === 0 ? '' : `${((totals.N / totals.total) * 100).toFixed(1)}%`;
+    const overallFlag = totals.total === 0 ? '' : ( ((totals.Y / totals.total) * 100) >= 95 ? 'Y' : 'N' );
+
+    compAOA.push(['Total', totals.Y, overallPctWithin, totals.N, overallPctExceed, totals.total, overallFlag]);
+
+    const wsComp = XLSX.utils.aoa_to_sheet(compAOA);
+    // merge the first title row across columns for nicer look
+    wsComp['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
+
+    // auto-width for comp sheet columns
+    const compCols = [];
+    for (let c = 0; c <= 6; c++) {
+      let maxLen = 0;
+      for (let r = 0; r < compAOA.length; r++) {
+        const cellValue = compAOA[r][c] != null ? compAOA[r][c] : '';
+        const txt = String(cellValue);
+        if (txt.length > maxLen) maxLen = txt.length;
+      }
+      compCols.push({ wch: Math.min(50, maxLen + 2) });
+    }
+    wsComp['!cols'] = compCols;
+
+    // create workbook, append only the processed sheets
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Processed');
+    XLSX.utils.book_append_sheet(wb, wsMain, 'Incident Intervals');
+
+    // Sheet name must be exactly 'Compliance and Credit' (no date)
+    XLSX.utils.book_append_sheet(wb, wsComp, 'Compliance and Credit');
+
     return wb;
   }
 
-  // ---- handleDownload: read with cellDates:true and write processed file ----
+  // DOWNLOAD (with more helpful error messages)
   async function handleDownload() {
     if (!fileValid || !inputFile) return;
     setProcessing(true);
@@ -381,13 +532,29 @@ export default function IncidentExcelProcessor(props) {
         const workbook = XLSX.read(data, { type: 'array', cellDates: true });
         const { rows } = parseWorkbook(workbook);
         const { headers, data: outData } = processRows(rows);
-        const wb = buildWorkbookWithDates(headers, outData);
+
+        if (!headers || headers.length === 0 || !Array.isArray(outData)) {
+          throw new Error('Processed output is empty or invalid — check input file columns (Number/Priority/Opened/Updated).');
+        }
+
+        const wb = buildWorkbookWithDates(headers, outData, rows);
+
+        if (!wb.SheetNames || wb.SheetNames.length === 0) {
+          throw new Error('Generated workbook has no sheets.');
+        }
+
         const outFileName = (fileName || 'output.xlsx').replace(/\.xlsx$/i, '') + '-processed.xlsx';
-        XLSX.writeFile(wb, outFileName, { cellDates: true });
-        setMessage(`Downloaded: ${outFileName}`);
+
+        try {
+          XLSX.writeFile(wb, outFileName, { cellDates: true });
+          setMessage(`Downloaded: ${outFileName}`);
+        } catch (innerErr) {
+          console.error('XLSX.writeFile failed:', innerErr);
+          setMessage(`Download failed: ${innerErr && innerErr.message ? innerErr.message : String(innerErr)}`);
+        }
       } catch (err) {
-        console.error(err);
-        setMessage('Error preparing download');
+        console.error('Error preparing download:', err);
+        setMessage(`Error preparing download: ${err && err.message ? err.message : String(err)}`);
       } finally {
         setProcessing(false);
       }
@@ -399,7 +566,7 @@ export default function IncidentExcelProcessor(props) {
     reader.readAsArrayBuffer(inputFile);
   }
 
-  // filtering/sorting memo
+  // Filtering & sorting memo
   const filteredAndSortedRows = useMemo(() => {
     if (!allRows || allRows.length === 0) return [];
     let rows = allRows;
@@ -462,7 +629,6 @@ export default function IncidentExcelProcessor(props) {
     setCurrentPage(1);
   }
 
-  // debounced global filter
   function onGlobalFilterChange(v) {
     if (globalFilterTimer.current) clearTimeout(globalFilterTimer.current);
     globalFilterTimer.current = setTimeout(() => { setGlobalFilter(v); setCurrentPage(1); }, 350);
@@ -479,7 +645,6 @@ export default function IncidentExcelProcessor(props) {
     setCurrentPage(1);
   }
 
-  // Preview table
   function PreviewTable() {
     if (!allHeaders || allHeaders.length === 0) return null;
     return (
@@ -555,21 +720,15 @@ export default function IncidentExcelProcessor(props) {
   return (
     <div style={{ fontFamily: 'Inter, Roboto, sans-serif', padding: 20 }}>
       <div style={{ maxWidth: 1100, margin: '0 auto', boxShadow: '0 6px 20px rgba(0,0,0,0.08)', borderRadius: 12, overflow: 'hidden' }}>
-        {/* Header with optional Logout */}
         <div style={{ background: 'linear-gradient(90deg,#0f172a,#0ea5a4)', color: 'white', padding: 24, display: 'flex', alignItems: 'center', gap: 16 }}>
           <div style={{ flex: 1 }}>
             <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700 }}>ERPA - Snow Data Incident Excel Processor</h1>
             <p style={{ marginTop: 6, opacity: 0.95 }}> * Upload the Excel File and this give the Incident Intervals TimeStamps * </p>
           </div>
-
-          {/* Logout button: prefer props.onLogout, else fallback to clearing localStorage and redirect */}
           <div>
             <button onClick={() => {
-              if (typeof props?.onLogout === 'function') {
-                props.onLogout();
-              } else {
-                try { localStorage.removeItem('erp_auth'); window.location.href = '/login'; } catch (e) { window.location.href = '/login'; }
-              }
+              if (typeof props?.onLogout === 'function') props.onLogout();
+              else { try { localStorage.removeItem('erp_auth'); window.location.href = '/login'; } catch (e) { window.location.href = '/login'; } }
             }} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.18)', background: 'transparent', color: 'white', cursor: 'pointer' }}>
               Logout
             </button>
@@ -614,7 +773,6 @@ export default function IncidentExcelProcessor(props) {
             )}
           </div>
 
-          {/* Preview table with sorting, filtering, pagination */}
           <div>
             <PreviewTable />
           </div>
@@ -626,7 +784,6 @@ export default function IncidentExcelProcessor(props) {
         </div>
       </div>
 
-      {/* Confirmation modal */}
       {showConfirmClear && (
         <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(2,6,23,0.5)', zIndex: 60 }}>
           <div style={{ width: 420, background: 'white', borderRadius: 12, padding: 20, boxShadow: '0 10px 40px rgba(2,6,23,0.6)' }}>
