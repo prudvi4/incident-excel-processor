@@ -273,7 +273,7 @@ export default function IncidentExcelProcessor(props) {
     const headers = ['Number', 'Priority', 'State', 'Opened Date TimeStamp'];
     for (let i = 0; i < maxUpdates; i++) {
       const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`;
-      const intervalCol = `Interval ${i + 1} (Opened->Updated)`;
+      const intervalCol = `Interval ${i + 1}`;
       const slaCol = `Interval ${i + 1} SLA`;
       headers.push(updCol, intervalCol, slaCol);
     }
@@ -296,7 +296,7 @@ export default function IncidentExcelProcessor(props) {
         const updDate = upd && upd.date ? upd.date : null;
         const updText = upd && upd.date ? formatIso(upd.date) : (upd ? String(upd.raw) : '');
         const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`;
-        const intervalCol = `Interval ${i + 1} (Opened->Updated)`;
+        const intervalCol = `Interval ${i + 1}`;
         const slaCol = `Interval ${i + 1} SLA`;
 
         row[updCol] = updText;
@@ -456,30 +456,42 @@ export default function IncidentExcelProcessor(props) {
       }
     }
 
-    // Build Compliance AOA with requested column names:
-    // Priority/SLA | Within SLA | Percentage for Within SLA | Exceeding SLA | Percentage for Exceeding SLA | Total Incidents According to the Priority | Compliance and Credit
+    // Build Compliance AOA with requested column order:
+    // Priority/SLA | Total Incidents According to the Priority | Within SLA | Percentage for Within SLA | Exceeding SLA | Percentage for Exceeding SLA | Compliance and Credit
     const compAOA = [];
-    // optional title row (left blank or show range) — but sheet name must be "Compliance and Credit", user asked no date in sheet name
     const titleText = minDate && maxDate ? `Compliance and Credit - ${formatShortDate(minDate)} to ${formatShortDate(maxDate)}` : 'Compliance and Credit';
     compAOA.push([titleText]);
     compAOA.push([
       'Priority/SLA',
+      'Total Incidents According to the Priority',
       'Within SLA',
       'Percentage for Within SLA',
       'Exceeding SLA',
       'Percentage for Exceeding SLA',
-      'Total Incidents According to the Priority',
       'Compliance and Credit'
     ]);
 
+    // Fill rows for P1..P4
     for (const p of priorities) {
       const { Y, N, total } = countsByPriority[p];
       const pctWithin = total === 0 ? '' : `${((Y / total) * 100).toFixed(1)}%`;
       const pctExceed = total === 0 ? '' : `${((N / total) * 100).toFixed(1)}%`;
-      const flag = total === 0 ? '' : ( ((Y / total) * 100) >= 95 ? 'Y' : 'N' );
-      compAOA.push([p, Y, pctWithin, N, pctExceed, total, flag]);
+      // Compliance flag: per latest user instruction -
+      // if Percentage Within SLA < 95% then mark as 'Y', otherwise 'N'
+      let flag = '';
+      if (p.startsWith('P1') || p.startsWith('P2')) {
+        if (total === 0) flag = '';
+        else {
+          const pct = (Y / total) * 100;
+          flag = pct < 95 ? 'Y' : 'N';
+        }
+      } else {
+        flag = ''; // P3, P4: no compliance flag per user instruction
+      }
+      compAOA.push([p, total, Y, pctWithin, N, pctExceed, flag]);
     }
 
+    // Add Totals row (only counts in B, C and E columns as requested)
     const totals = priorities.reduce((acc, p) => {
       acc.Y += countsByPriority[p].Y;
       acc.N += countsByPriority[p].N;
@@ -487,26 +499,25 @@ export default function IncidentExcelProcessor(props) {
       return acc;
     }, { Y: 0, N: 0, total: 0 });
 
-    const overallPctWithin = totals.total === 0 ? '' : `${((totals.Y / totals.total) * 100).toFixed(1)}%`;
-    const overallPctExceed = totals.total === 0 ? '' : `${((totals.N / totals.total) * 100).toFixed(1)}%`;
-    const overallFlag = totals.total === 0 ? '' : ( ((totals.Y / totals.total) * 100) >= 95 ? 'Y' : 'N' );
-
-    compAOA.push(['Total', totals.Y, overallPctWithin, totals.N, overallPctExceed, totals.total, overallFlag]);
+    // Totals row: 'Total' | totalIncidents | totalWithinY | ''(pct within) | totalExceedN | ''(pct exceed) | ''(compliance)
+    compAOA.push(['Total', totals.total, totals.Y, '', totals.N, '', '']);
 
     const wsComp = XLSX.utils.aoa_to_sheet(compAOA);
     // merge the first title row across columns for nicer look
     wsComp['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
 
-    // auto-width for comp sheet columns
-    const compCols = [];
-    for (let c = 0; c <= 6; c++) {
+    // auto-width for comp sheet columns based on content lengths
+    const cols = 7;
+    const compCols = new Array(cols).fill({ wch: 10 });
+    for (let c = 0; c < cols; c++) {
       let maxLen = 0;
       for (let r = 0; r < compAOA.length; r++) {
-        const cellValue = compAOA[r][c] != null ? compAOA[r][c] : '';
-        const txt = String(cellValue);
-        if (txt.length > maxLen) maxLen = txt.length;
+        const cell = compAOA[r][c];
+        const txt = cell === undefined || cell === null ? '' : String(cell);
+        maxLen = Math.max(maxLen, txt.length);
       }
-      compCols.push({ wch: Math.min(50, maxLen + 2) });
+      const wch = Math.min(50, Math.max(10, Math.ceil(maxLen) + 2));
+      compCols[c] = { wch };
     }
     wsComp['!cols'] = compCols;
 
@@ -514,13 +525,13 @@ export default function IncidentExcelProcessor(props) {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, wsMain, 'Incident Intervals');
 
-    // Sheet name must be exactly 'Compliance and Credit' (no date)
+    // Sheet name must be exactly 'Compliance and Credit' (no date in sheet name)
     XLSX.utils.book_append_sheet(wb, wsComp, 'Compliance and Credit');
 
     return wb;
   }
 
-  // DOWNLOAD (with more helpful error messages)
+  // DOWNLOAD (with helpful error messages)
   async function handleDownload() {
     if (!fileValid || !inputFile) return;
     setProcessing(true);
@@ -751,7 +762,7 @@ export default function IncidentExcelProcessor(props) {
               {processing ? 'Working...' : 'Generate Preview'}
             </button>
 
-            <button onClick={handleDownload} disabled={!fileValid || processing || totalRowsCount === 0} style={{ padding: '10px 16px', background: (!fileValid || processing || totalRowsCount === 0) ? '#f1f5f9' : '#0891b2', color: (!fileValid || processing || totalRowsCount === 0) ? '#94a3b8' : 'white', borderRadius: 8, border: 'none', cursor: (!fileValid || processing || totalRowsCount === 0) ? 'not-allowed' : 'pointer' }}>
+            <button onClick={() => handleDownload()} disabled={!fileValid || processing || totalRowsCount === 0} style={{ padding: '10px 16px', background: (!fileValid || processing || totalRowsCount === 0) ? '#f1f5f9' : '#0891b2', color: (!fileValid || processing || totalRowsCount === 0) ? '#94a3b8' : 'white', borderRadius: 8, border: 'none', cursor: (!fileValid || processing || totalRowsCount === 0) ? 'not-allowed' : 'pointer' }}>
               Download Full File
             </button>
 
