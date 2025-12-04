@@ -1,8 +1,10 @@
 // src/IncidentExcelProcessor.jsx
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { saveAs } from 'file-saver';
 
-// Incident Excel Processor - SLA columns + final "Within SLA" + Compliance sheet
+// Incident Excel Processor - preview (SheetJS) + download (ExcelJS with styles)
 export default function IncidentExcelProcessor(props) {
   const [fileName, setFileName] = useState(null);
   const [fileValid, setFileValid] = useState(false);
@@ -273,7 +275,7 @@ export default function IncidentExcelProcessor(props) {
     const headers = ['Number', 'Priority', 'State', 'Opened Date TimeStamp'];
     for (let i = 0; i < maxUpdates; i++) {
       const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`;
-      const intervalCol = `Interval ${i + 1}`;
+      const intervalCol = `Interval ${i + 1} (Opened->Updated)`;
       const slaCol = `Interval ${i + 1} SLA`;
       headers.push(updCol, intervalCol, slaCol);
     }
@@ -296,7 +298,7 @@ export default function IncidentExcelProcessor(props) {
         const updDate = upd && upd.date ? upd.date : null;
         const updText = upd && upd.date ? formatIso(upd.date) : (upd ? String(upd.raw) : '');
         const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated TimeStamp`;
-        const intervalCol = `Interval ${i + 1}`;
+        const intervalCol = `Interval ${i + 1} (Opened->Updated)`;
         const slaCol = `Interval ${i + 1} SLA`;
 
         row[updCol] = updText;
@@ -368,201 +370,199 @@ export default function IncidentExcelProcessor(props) {
     reader.readAsArrayBuffer(inputFile);
   }
 
-  // Build workbook for download: Incident Intervals + Compliance sheet (no raw sheet)
-  function buildWorkbookWithDates(headers, rows, rawRows) {
-    const dateColumns = headers.filter(h => /Opened|Updated/i.test(h));
-
-    // AOA for Incident Intervals
-    const aoa = [headers];
-    for (const r of rows) {
-      const row = headers.map(h => {
-        const v = r[h];
-        if (v == null || v === '') return '';
-        if (dateColumns.includes(h)) {
-          const d = parseToDate(v);
-          if (d) return d;
-        }
-        return v;
-      });
-      aoa.push(row);
-    }
-    const wsMain = XLSX.utils.aoa_to_sheet(aoa);
-
-    // Auto-fit columns for main sheet
-    const MAX_WCH = 50;
-    const DATE_WCH = 20;
-    wsMain['!cols'] = headers.map((h, colIdx) => {
-      let maxLen = String(h || '').length;
-      for (let r = 1; r < aoa.length; r++) {
-        const cellValue = aoa[r][colIdx] != null ? aoa[r][colIdx] : '';
-        if (cellValue instanceof Date) {
-          maxLen = Math.max(maxLen, DATE_WCH);
-          continue;
-        }
-        const txt = String(cellValue);
-        if (txt.length > maxLen) maxLen = txt.length;
-      }
-      let wch = Math.min(MAX_WCH, maxLen + 2);
-      if (dateColumns.includes(h)) wch = Math.max(wch, DATE_WCH);
-      return { wch };
-    });
-
-    // Apply timestamp format to date cells
-    if (wsMain['!ref']) {
-      const range = XLSX.utils.decode_range(wsMain['!ref']);
-      for (let R = 1; R <= range.e.r; R++) {
-        for (let C = 0; C <= range.e.c; C++) {
-          const header = headers[C];
-          if (!dateColumns.includes(header)) continue;
-          const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
-          const cell = wsMain[cellAddress];
-          if (cell && (cell.t === 'n' || cell.t === 'd')) {
-            cell.z = "dd-mm-yyyy hh:mm AM/PM";
-          }
-        }
-      }
-    }
-
-    // Build Compliance & Credit sheet (metrics)
-    let minDate = null;
-    let maxDate = null;
-    if (Array.isArray(rawRows)) {
-      for (const r of rawRows) {
-        for (const k of Object.keys(r)) {
-          const v = r[k];
-          const d = parseToDate(v);
-          if (d) {
-            if (!minDate || d < minDate) minDate = d;
-            if (!maxDate || d > maxDate) maxDate = d;
-          }
-        }
-      }
-    }
-
-    // Priorities list and counters
-    const priorities = ['P1 - Critical', 'P2 - High', 'P3 - Medium', 'P4 - Low'];
-    const countsByPriority = {};
-    for (const p of priorities) countsByPriority[p] = { Y: 0, N: 0, total: 0 };
-
-    for (const r of rows) {
-      const pr = (r['Priority'] || '').toString().trim();
-      // match based on starting P1/P2/P3/P4 portion
-      const key = priorities.find(pp => pr.toUpperCase().startsWith(pp.split(' ')[0].toUpperCase()));
-      if (key) {
-        countsByPriority[key].total++;
-        const within = String(r['Within SLA'] || '').trim().toUpperCase();
-        if (within === 'Y') countsByPriority[key].Y++;
-        else if (within === 'N') countsByPriority[key].N++;
-      }
-    }
-
-    // Build Compliance AOA with requested column order:
-    // Priority/SLA | Total Incidents According to the Priority | Within SLA | Percentage for Within SLA | Exceeding SLA | Percentage for Exceeding SLA | Compliance and Credit
-    const compAOA = [];
-    const titleText = minDate && maxDate ? `Compliance and Credit - ${formatShortDate(minDate)} to ${formatShortDate(maxDate)}` : 'Compliance and Credit';
-    compAOA.push([titleText]);
-    compAOA.push([
-      'Priority/SLA',
-      'Total Incidents According to the Priority',
-      'Within SLA',
-      'Percentage for Within SLA',
-      'Exceeding SLA',
-      'Percentage for Exceeding SLA',
-      'Compliance and Credit'
-    ]);
-
-    // Fill rows for P1..P4
-    for (const p of priorities) {
-      const { Y, N, total } = countsByPriority[p];
-      const pctWithin = total === 0 ? '' : `${((Y / total) * 100).toFixed(1)}%`;
-      const pctExceed = total === 0 ? '' : `${((N / total) * 100).toFixed(1)}%`;
-      // Compliance flag: per latest user instruction -
-      // if Percentage Within SLA < 95% then mark as 'Y', otherwise 'N'
-      let flag = '';
-      if (p.startsWith('P1') || p.startsWith('P2')) {
-        if (total === 0) flag = '';
-        else {
-          const pct = (Y / total) * 100;
-          flag = pct < 95 ? 'Y' : 'N';
-        }
-      } else {
-        flag = ''; // P3, P4: no compliance flag per user instruction
-      }
-      compAOA.push([p, total, Y, pctWithin, N, pctExceed, flag]);
-    }
-
-    // Add Totals row (only counts in B, C and E columns as requested)
-    const totals = priorities.reduce((acc, p) => {
-      acc.Y += countsByPriority[p].Y;
-      acc.N += countsByPriority[p].N;
-      acc.total += countsByPriority[p].total;
-      return acc;
-    }, { Y: 0, N: 0, total: 0 });
-
-    // Totals row: 'Total' | totalIncidents | totalWithinY | ''(pct within) | totalExceedN | ''(pct exceed) | ''(compliance)
-    compAOA.push(['Total', totals.total, totals.Y, '', totals.N, '', '']);
-
-    const wsComp = XLSX.utils.aoa_to_sheet(compAOA);
-    // merge the first title row across columns for nicer look
-    wsComp['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
-
-    // auto-width for comp sheet columns based on content lengths
-    const cols = 7;
-    const compCols = new Array(cols).fill({ wch: 10 });
-    for (let c = 0; c < cols; c++) {
-      let maxLen = 0;
-      for (let r = 0; r < compAOA.length; r++) {
-        const cell = compAOA[r][c];
-        const txt = cell === undefined || cell === null ? '' : String(cell);
-        maxLen = Math.max(maxLen, txt.length);
-      }
-      const wch = Math.min(50, Math.max(10, Math.ceil(maxLen) + 2));
-      compCols[c] = { wch };
-    }
-    wsComp['!cols'] = compCols;
-
-    // create workbook, append only the processed sheets
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, wsMain, 'Incident Intervals');
-
-    // Sheet name must be exactly 'Compliance and Credit' (no date in sheet name)
-    XLSX.utils.book_append_sheet(wb, wsComp, 'Compliance and Credit');
-
-    return wb;
-  }
-
-  // DOWNLOAD (with helpful error messages)
+  // ---------------------------
+  // DOWNLOAD using exceljs (so we can set alignment / style)
+  // ---------------------------
   async function handleDownload() {
     if (!fileValid || !inputFile) return;
     setProcessing(true);
     setMessage('Preparing download...');
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const data = ev.target.result;
+        // parse input with SheetJS so we can re-run processRows (same as preview)
         const workbook = XLSX.read(data, { type: 'array', cellDates: true });
-        const { rows } = parseWorkbook(workbook);
-        const { headers, data: outData } = processRows(rows);
+        const { rows: rawRows } = parseWorkbook(workbook);
+        const { headers, data: processedRows } = processRows(rawRows);
 
-        if (!headers || headers.length === 0 || !Array.isArray(outData)) {
+        if (!headers || headers.length === 0 || !Array.isArray(processedRows)) {
           throw new Error('Processed output is empty or invalid — check input file columns (Number/Priority/Opened/Updated).');
         }
 
-        const wb = buildWorkbookWithDates(headers, outData, rows);
+        // Build excel with exceljs
+        const wb = new ExcelJS.Workbook();
 
-        if (!wb.SheetNames || wb.SheetNames.length === 0) {
-          throw new Error('Generated workbook has no sheets.');
+        //
+        // Incident Intervals sheet
+        //
+        const wsMain = wb.addWorksheet('Incident Intervals', { views: [{ state: 'normal' }] });
+
+        // compute a compact column width set
+        const dateColumns = headers.filter(h => /Opened|Updated/i.test(h));
+        // prepare column widths based on headers & sample data length
+        const cols = headers.map((h, colIdx) => {
+          let maxLen = String(h || '').length;
+          for (let r = 0; r < processedRows.length; r++) {
+            const val = processedRows[r][h];
+            const txt = val == null ? '' : String(val);
+            if (txt.length > maxLen) maxLen = txt.length;
+          }
+          let width = Math.min(40, Math.max(8, maxLen + 2));
+          if (dateColumns.includes(h)) width = Math.max(width, 18);
+          if (width > 40) width = 40;
+          return { header: h, key: h, width };
+        });
+        wsMain.columns = cols;
+
+        // header row bold
+        const headerRow = wsMain.getRow(1);
+        headerRow.font = { bold: true };
+
+        // add all rows, preserving dates for date columns
+        for (const r of processedRows) {
+          const rowVals = headers.map(h => {
+            const v = r[h];
+            if ((v == null || v === '') && dateColumns.includes(h)) return '';
+            // convert ISO formatted date back to Date for exceljs if possible
+            if (dateColumns.includes(h)) {
+              const d = parseToDate(v);
+              if (d) return d;
+            }
+            return v == null ? '' : v;
+          });
+          wsMain.addRow(rowVals);
         }
 
+        // apply timestamp style for date cells in wsMain
+        wsMain.columns.forEach((col, idx) => {
+          const header = col.header;
+          if (dateColumns.includes(header)) {
+            wsMain.eachRow((row, rowNumber) => {
+              // skip header row
+              if (rowNumber === 1) return;
+              const cell = row.getCell(idx + 1);
+              if (cell && cell.value instanceof Date) {
+                cell.numFmt = 'dd-mm-yyyy hh:mm AM/PM';
+              }
+            });
+          }
+        });
+
+        //
+        // Compliance and Credit sheet
+        //
+        const wsComp = wb.addWorksheet('Compliance and Credit', { views: [{ state: 'normal' }] });
+
+        // find min/max dates from rawRows for title
+        let minDate = null, maxDate = null;
+        if (Array.isArray(rawRows)) {
+          for (const r of rawRows) {
+            for (const k of Object.keys(r)) {
+              const d = parseToDate(r[k]);
+              if (d) {
+                if (!minDate || d < minDate) minDate = d;
+                if (!maxDate || d > maxDate) maxDate = d;
+              }
+            }
+          }
+        }
+        const titleText = minDate && maxDate ? `Compliance and Credit - ${formatShortDate(minDate)} to ${formatShortDate(maxDate)}` : 'Compliance and Credit';
+        // columns in requested order:
+        const compCols = [
+          { header: 'Priority/SLA', key: 'priority', width: 18 },
+          { header: 'Total Incidents', key: 'total', width: 14 },
+          { header: 'Within SLA', key: 'within', width: 12 },
+          { header: '% for Within SLA', key: 'pct_within', width: 14 },
+          { header: 'Exceeding SLA', key: 'exceed', width: 14 },
+          { header: 'Compliance and Credit', key: 'flag', width: 16 }
+        ];
+        wsComp.columns = compCols;
+
+        // Title row merged across columns (1..6)
+        wsComp.mergeCells(1, 1, 1, compCols.length);
+        const titleCell = wsComp.getCell(1, 1);
+        titleCell.value = titleText;
+        titleCell.font = { bold: true, size: 12 };
+        titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+        // Header row content (row 2)
+        const headersRow = wsComp.getRow(2);
+        for (let c = 0; c < compCols.length; c++) {
+          const cell = headersRow.getCell(c + 1);
+          cell.value = compCols[c].header;
+          cell.font = { bold: true };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        }
+
+        // compute counts per priority
+        const priorities = ['P1 - Critical', 'P2 - High', 'P3 - Medium', 'P4 - Low'];
+        const countsByPriority = {};
+        for (const p of priorities) countsByPriority[p] = { Y: 0, N: 0, total: 0 };
+
+        for (const r of processedRows) {
+          const pr = (r['Priority'] || '').toString().trim();
+          const key = priorities.find(pp => {
+            const prefix = pp.split(' ')[0].toUpperCase();
+            return pr.toUpperCase().startsWith(prefix);
+          });
+          if (key) {
+            countsByPriority[key].total++;
+            const within = String(r['Within SLA'] || '').trim().toUpperCase();
+            if (within === 'Y') countsByPriority[key].Y++;
+            else if (within === 'N') countsByPriority[key].N++;
+          }
+        }
+
+        // Add the 4 priority rows
+        let rowIndex = 3;
+        for (const p of priorities) {
+          const { Y, N, total } = countsByPriority[p];
+          const pctWithin = total === 0 ? '' : `${((Y / total) * 100).toFixed(1)}%`;
+          // Compliance & Credit rule:
+          // - only for P1 and P2. For P3/P4 leave blank.
+          // - If %WithinSLA < 95% => 'Y' (issue), else 'N'
+          let flag = '';
+          if (p.startsWith('P1') || p.startsWith('P2')) {
+            if (total === 0) flag = '';
+            else {
+              const pct = (Y / total) * 100;
+              flag = pct < 95 ? 'Y' : 'N';
+            }
+          }
+          const rvals = [p, total, Y, pctWithin, N, flag];
+          const row = wsComp.addRow(rvals);
+          // center all cells of this row
+          row.eachCell(cell => {
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          });
+          rowIndex++;
+        }
+
+        // Totals row (only counts shown: Total Incidents, Within SLA, Exceeding SLA)
+        const totals = priorities.reduce((acc, p) => {
+          acc.total += countsByPriority[p].total;
+          acc.Y += countsByPriority[p].Y;
+          acc.N += countsByPriority[p].N;
+          return acc;
+        }, { total: 0, Y: 0, N: 0 });
+        const totalsRow = wsComp.addRow(['Total', totals.total, totals.Y, '', totals.N, '']);
+        totalsRow.eachCell(cell => {
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        });
+        // optional bold totals label
+        totalsRow.getCell(1).font = { bold: true };
+
+        // Make whole sheet compact and center: already set column widths; center applied to rows.
+        // also set a small default row height if needed
+        wsComp.properties.defaultRowHeight = 18;
+
+        // Finally write workbook buffer and download using FileSaver
         const outFileName = (fileName || 'output.xlsx').replace(/\.xlsx$/i, '') + '-processed.xlsx';
+        const buffer = await wb.xlsx.writeBuffer();
+        saveAs(new Blob([buffer]), outFileName);
 
-        try {
-          XLSX.writeFile(wb, outFileName, { cellDates: true });
-          setMessage(`Downloaded: ${outFileName}`);
-        } catch (innerErr) {
-          console.error('XLSX.writeFile failed:', innerErr);
-          setMessage(`Download failed: ${innerErr && innerErr.message ? innerErr.message : String(innerErr)}`);
-        }
+        setMessage(`Downloaded: ${outFileName}`);
       } catch (err) {
         console.error('Error preparing download:', err);
         setMessage(`Error preparing download: ${err && err.message ? err.message : String(err)}`);
@@ -577,7 +577,7 @@ export default function IncidentExcelProcessor(props) {
     reader.readAsArrayBuffer(inputFile);
   }
 
-  // Filtering & sorting memo
+  // Filtering & sorting memo (unchanged)
   const filteredAndSortedRows = useMemo(() => {
     if (!allRows || allRows.length === 0) return [];
     let rows = allRows;
@@ -731,6 +731,7 @@ export default function IncidentExcelProcessor(props) {
   return (
     <div style={{ fontFamily: 'Inter, Roboto, sans-serif', padding: 20 }}>
       <div style={{ maxWidth: 1100, margin: '0 auto', boxShadow: '0 6px 20px rgba(0,0,0,0.08)', borderRadius: 12, overflow: 'hidden' }}>
+        {/* Header */}
         <div style={{ background: 'linear-gradient(90deg,#0f172a,#0ea5a4)', color: 'white', padding: 24, display: 'flex', alignItems: 'center', gap: 16 }}>
           <div style={{ flex: 1 }}>
             <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700 }}>ERPA - Snow Data Incident Excel Processor</h1>
@@ -762,7 +763,7 @@ export default function IncidentExcelProcessor(props) {
               {processing ? 'Working...' : 'Generate Preview'}
             </button>
 
-            <button onClick={() => handleDownload()} disabled={!fileValid || processing || totalRowsCount === 0} style={{ padding: '10px 16px', background: (!fileValid || processing || totalRowsCount === 0) ? '#f1f5f9' : '#0891b2', color: (!fileValid || processing || totalRowsCount === 0) ? '#94a3b8' : 'white', borderRadius: 8, border: 'none', cursor: (!fileValid || processing || totalRowsCount === 0) ? 'not-allowed' : 'pointer' }}>
+            <button onClick={handleDownload} disabled={!fileValid || processing || totalRowsCount === 0} style={{ padding: '10px 16px', background: (!fileValid || processing || totalRowsCount === 0) ? '#f1f5f9' : '#0891b2', color: (!fileValid || processing || totalRowsCount === 0) ? '#94a3b8' : 'white', borderRadius: 8, border: 'none', cursor: (!fileValid || processing || totalRowsCount === 0) ? 'not-allowed' : 'pointer' }}>
               Download Full File
             </button>
 
