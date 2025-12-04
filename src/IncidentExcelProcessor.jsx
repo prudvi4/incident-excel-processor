@@ -4,7 +4,7 @@ import * as XLSX from 'xlsx';
 import ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
 
-// Incident Excel Processor - preview (SheetJS) + download (ExcelJS with styles)
+// Incident Excel Processor - preview (SheetJS) + download (ExcelJS with styles & auto-fit comp sheet)
 export default function IncidentExcelProcessor(props) {
   const [fileName, setFileName] = useState(null);
   const [fileValid, setFileValid] = useState(false);
@@ -371,7 +371,7 @@ export default function IncidentExcelProcessor(props) {
   }
 
   // ---------------------------
-  // DOWNLOAD using exceljs (so we can set alignment / style)
+  // DOWNLOAD using exceljs (so we can set alignment / style & auto-fit comp sheet)
   // ---------------------------
   async function handleDownload() {
     if (!fileValid || !inputFile) return;
@@ -450,7 +450,7 @@ export default function IncidentExcelProcessor(props) {
         });
 
         //
-        // Compliance and Credit sheet
+        // Compliance and Credit sheet (auto-fit columns based on content)
         //
         const wsComp = wb.addWorksheet('Compliance and Credit', { views: [{ state: 'normal' }] });
 
@@ -468,34 +468,8 @@ export default function IncidentExcelProcessor(props) {
           }
         }
         const titleText = minDate && maxDate ? `Compliance and Credit - ${formatShortDate(minDate)} to ${formatShortDate(maxDate)}` : 'Compliance and Credit';
-        // columns in requested order:
-        const compCols = [
-          { header: 'Priority/SLA', key: 'priority', width: 18 },
-          { header: 'Total Incidents', key: 'total', width: 14 },
-          { header: 'Within SLA', key: 'within', width: 12 },
-          { header: '% for Within SLA', key: 'pct_within', width: 14 },
-          { header: 'Exceeding SLA', key: 'exceed', width: 14 },
-          { header: 'Compliance and Credit', key: 'flag', width: 16 }
-        ];
-        wsComp.columns = compCols;
 
-        // Title row merged across columns (1..6)
-        wsComp.mergeCells(1, 1, 1, compCols.length);
-        const titleCell = wsComp.getCell(1, 1);
-        titleCell.value = titleText;
-        titleCell.font = { bold: true, size: 12 };
-        titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
-
-        // Header row content (row 2)
-        const headersRow = wsComp.getRow(2);
-        for (let c = 0; c < compCols.length; c++) {
-          const cell = headersRow.getCell(c + 1);
-          cell.value = compCols[c].header;
-          cell.font = { bold: true };
-          cell.alignment = { horizontal: 'center', vertical: 'middle' };
-        }
-
-        // compute counts per priority
+        // Priorities and counts
         const priorities = ['P1 - Critical', 'P2 - High', 'P3 - Medium', 'P4 - Low'];
         const countsByPriority = {};
         for (const p of priorities) countsByPriority[p] = { Y: 0, N: 0, total: 0 };
@@ -514,14 +488,19 @@ export default function IncidentExcelProcessor(props) {
           }
         }
 
-        // Add the 4 priority rows
-        let rowIndex = 3;
+        // Build comp rows (we will compute widths from these)
+        const compRows = [];
+        // Title row (single cell row)
+        compRows.push([titleText]);
+        // Header row (columns)
+        const headerRowVals = ['Priority/SLA', 'Total Incidents', 'Within SLA', '% for Within SLA', 'Exceeding SLA', 'Compliance and Credit'];
+        compRows.push(headerRowVals);
+
+        // Rows per priority
         for (const p of priorities) {
           const { Y, N, total } = countsByPriority[p];
           const pctWithin = total === 0 ? '' : `${((Y / total) * 100).toFixed(1)}%`;
-          // Compliance & Credit rule:
-          // - only for P1 and P2. For P3/P4 leave blank.
-          // - If %WithinSLA < 95% => 'Y' (issue), else 'N'
+          // Compliance rule: only for P1 and P2; if %WithinSLA < 95% -> 'Y' else 'N'; P3/P4 left blank
           let flag = '';
           if (p.startsWith('P1') || p.startsWith('P2')) {
             if (total === 0) flag = '';
@@ -530,34 +509,81 @@ export default function IncidentExcelProcessor(props) {
               flag = pct < 95 ? 'Y' : 'N';
             }
           }
-          const rvals = [p, total, Y, pctWithin, N, flag];
-          const row = wsComp.addRow(rvals);
-          // center all cells of this row
-          row.eachCell(cell => {
-            cell.alignment = { horizontal: 'center', vertical: 'middle' };
-          });
-          rowIndex++;
+          compRows.push([p, total, Y, pctWithin, N, flag]);
         }
 
-        // Totals row (only counts shown: Total Incidents, Within SLA, Exceeding SLA)
+        // Totals row (only counts shown per your request)
         const totals = priorities.reduce((acc, p) => {
           acc.total += countsByPriority[p].total;
           acc.Y += countsByPriority[p].Y;
           acc.N += countsByPriority[p].N;
           return acc;
         }, { total: 0, Y: 0, N: 0 });
-        const totalsRow = wsComp.addRow(['Total', totals.total, totals.Y, '', totals.N, '']);
-        totalsRow.eachCell(cell => {
-          cell.alignment = { horizontal: 'center', vertical: 'middle' };
-        });
-        // optional bold totals label
-        totalsRow.getCell(1).font = { bold: true };
+        compRows.push(['Total', totals.total, totals.Y, '', totals.N, '']);
 
-        // Make whole sheet compact and center: already set column widths; center applied to rows.
-        // also set a small default row height if needed
+        // Compute auto-fit widths for each column from compRows content
+        const numCols = headerRowVals.length;
+        const colMax = new Array(numCols).fill(0);
+        for (let r = 0; r < compRows.length; r++) {
+          const row = compRows[r];
+          for (let c = 0; c < numCols; c++) {
+            const txt = row[c] == null ? '' : String(row[c]);
+            // approximate width: characters count (Excel column width is approx chars)
+            const len = txt.length;
+            if (len > colMax[c]) colMax[c] = len;
+          }
+        }
+        // set a min and max width
+        const minWidth = 8;
+        const maxWidth = 40;
+        const compCols = [];
+        for (let c = 0; c < numCols; c++) {
+          // add small padding
+          let width = Math.min(maxWidth, Math.max(minWidth, colMax[c] + 4));
+          // ensure % column gets slightly wider for readability
+          if (headerRowVals[c].includes('%')) width = Math.max(width, 12);
+          compCols.push({ header: headerRowVals[c], key: `c${c}`, width });
+        }
+        wsComp.columns = compCols;
+
+        // Populate wsComp rows and style/center them
+        // Row 1: merged title across all compCols
+        wsComp.mergeCells(1, 1, 1, numCols);
+        const tcell = wsComp.getCell(1, 1);
+        tcell.value = titleText;
+        tcell.font = { bold: true };
+        tcell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+        // Row 2: headers (already in wsComp.columns but let's set them visibly in the sheet)
+        const hdrRow = wsComp.getRow(2);
+        for (let c = 0; c < numCols; c++) {
+          const cell = hdrRow.getCell(c + 1);
+          cell.value = headerRowVals[c];
+          cell.font = { bold: true };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        }
+
+        // Add priority rows (starting row index 3)
+        let compRowIndex = 3;
+        for (let i = 2; i < compRows.length; i++) {
+          const values = compRows[i];
+          const row = wsComp.getRow(compRowIndex);
+          for (let c = 0; c < numCols; c++) {
+            const cell = row.getCell(c + 1);
+            cell.value = values[c] == null ? '' : values[c];
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          }
+          compRowIndex++;
+        }
+
+        // Make totals label bold (first cell of last row)
+        const totalsExcelRow = wsComp.getRow(compRowIndex - 1);
+        totalsExcelRow.getCell(1).font = { bold: true };
+
+        // reduce default row height to make sheet compact
         wsComp.properties.defaultRowHeight = 18;
 
-        // Finally write workbook buffer and download using FileSaver
+        // Final write + download
         const outFileName = (fileName || 'output.xlsx').replace(/\.xlsx$/i, '') + '-processed.xlsx';
         const buffer = await wb.xlsx.writeBuffer();
         saveAs(new Blob([buffer]), outFileName);
