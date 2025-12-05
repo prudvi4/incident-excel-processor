@@ -119,33 +119,28 @@ export default function IncidentExcelProcessor(props) {
   }
 
   // --- Date helpers ---
+
+  // Simple conversion from Excel serial to Date (local time)
   function excelSerialToDate(serial) {
     if (typeof serial !== 'number') return null;
-    const utcMs = (serial - 25569) * 86400 * 1000;
-    const d = new Date(utcMs);
-    return new Date(
-      d.getUTCFullYear(),
-      d.getUTCMonth(),
-      d.getUTCDate(),
-      d.getUTCHours(),
-      d.getUTCMinutes(),
-      d.getUTCSeconds(),
-      d.getUTCMilliseconds()
-    );
+    const ms = (serial - 25569) * 86400 * 1000; // 25569 = days from 1899-12-30 to 1970-01-01
+    return new Date(ms);
   }
 
+  // Parse dd-mm-yyyy / dd/mm/yyyy first, then fall back to Date.parse
   function parseToDate(val) {
     if (val == null || val === '') return null;
+
     if (val instanceof Date && !isNaN(val)) return val;
+
     if (typeof val === 'number') {
       const d = excelSerialToDate(val);
       if (d && !isNaN(d)) return d;
+      return null;
     }
+
     const s = String(val).trim();
-    // Try native parser first (handles ISO etc.)
-    const p = Date.parse(s);
-    if (!isNaN(p)) return new Date(p);
-    // dd/mm/yyyy or dd-mm-yyyy with time and AM/PM
+
     const re =
       /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})[ ,T](\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?$/;
     const m = s.match(re);
@@ -164,6 +159,11 @@ export default function IncidentExcelProcessor(props) {
       }
       return new Date(year, month, day, hour, minute, second);
     }
+
+    // Fallback: let JS try for ISO-like strings
+    const p = Date.parse(s.replace(' ', 'T'));
+    if (!isNaN(p)) return new Date(p);
+
     return null;
   }
 
@@ -423,22 +423,21 @@ export default function IncidentExcelProcessor(props) {
     // -------- Incident Intervals sheet --------
     const sheet1 = wb.addWorksheet('Incident Intervals');
 
+    // Header row
     sheet1.addRow(headers);
 
-    const dateColsIdx = headers
+    // Determine SLA columns (for centering)
+    const slaColIdx = headers
       .map((h, i) => ({ h, i }))
-      .filter((x) => /Opened|Updated/i.test(x.h))
+      .filter((x) => /^Made SLA \d+$/.test(x.h) || x.h === 'Made SLA')
       .map((x) => x.i + 1);
 
+    // Data rows – IMPORTANT: keep date/time as TEXT, no Date objects → avoids timezone shift
     for (const r of rows) {
       const rowVals = headers.map((h) => {
         const v = r[h];
         if (v == null || v === '') return null;
-        if (dateColsIdx.includes(headers.indexOf(h) + 1)) {
-          const d = parseToDate(v);
-          if (d) return d;
-        }
-        return v;
+        return v; // always write as-is (string/number)
       });
       sheet1.addRow(rowVals);
     }
@@ -447,67 +446,67 @@ export default function IncidentExcelProcessor(props) {
     headerRow1.alignment = { horizontal: 'center', vertical: 'middle' };
     headerRow1.font = { bold: true };
 
-    // Auto width
+    // Auto width for sheet1
     sheet1.columns = headers.map((h, colIdx) => {
       let maxLen = String(h || '').length;
       for (let r = 2; r <= sheet1.rowCount; r++) {
         const cell = sheet1.getRow(r).getCell(colIdx + 1);
-        let txt;
-        if (cell.value instanceof Date) {
-          // approximate real display: dd-mm-yyyy hh:mm AM/PM
-          txt = 'dd-mm-yyyy hh:mm AM/PM';
-        } else {
-          txt = cell.value ?? '';
-        }
-        const l = String(txt).length;
+        const txt = cell.value != null ? String(cell.value) : '';
+        const l = txt.length;
         if (l > maxLen) maxLen = l;
       }
-      let w = Math.min(60, Math.max(10, maxLen + 2));
+      const w = Math.min(60, Math.max(12, maxLen + 2));
       return { header: h, width: w };
     });
 
-    // Format date columns and ensure they are wide enough (avoid #######)
-    for (const c of dateColsIdx) {
-      const col = sheet1.getColumn(c);
-      col.numFmt = 'dd-mm-yyyy hh:mm AM/PM';
-      if (!col.width || col.width < 22) col.width = 22;
-    }
-
     // Center SLA columns in sheet1
-    headers.forEach((h, idx) => {
-      if (/^Made SLA \d+$/.test(h) || h === 'Made SLA') {
-        const col = sheet1.getColumn(idx + 1);
-        col.alignment = { horizontal: 'center', vertical: 'middle' };
-      }
-    });
+    for (const c of slaColIdx) {
+      const col = sheet1.getColumn(c);
+      col.alignment = { horizontal: 'center', vertical: 'middle' };
+    }
 
     sheet1.views = [{ state: 'frozen', ySplit: 1 }];
 
     // -------- Compliance and Credit sheet --------
     const sheet2 = wb.addWorksheet('Compliance and Credit');
 
-    // Compute min/max Opened Date from RAW rows, using "Opened"/"Opened Date" column
+    // 1) Try to get min/max from processed "Opened Date" column (rows param)
     let minOpened = null;
     let maxOpened = null;
 
-    if (Array.isArray(rawRows)) {
+    if (Array.isArray(rows)) {
+      for (const r of rows) {
+        const dt = parseToDate(r['Opened Date']);
+        if (!dt) continue;
+        if (!minOpened || dt < minOpened) minOpened = dt;
+        if (!maxOpened || dt > maxOpened) maxOpened = dt;
+      }
+    }
+
+    // 2) If still not found, fall back to rawRows.Opened (very defensive)
+    if ((!minOpened || !maxOpened) && Array.isArray(rawRows) && rawRows.length > 0) {
+      const firstKeys = Object.keys(rawRows[0]);
+      const openedKey =
+        firstKeys.find(
+          (k) => k.toLowerCase().replace(/[^a-z0-9]/g, '') === 'opened'
+        ) || 'Opened';
+
       for (const rr of rawRows) {
-        const keys = Object.keys(rr);
-        const openedKey = normalizeKey(keys, 'Opened');
-        if (openedKey) {
-          const dt = parseToDate(rr[openedKey]);
-          if (dt) {
-            if (!minOpened || dt < minOpened) minOpened = dt;
-            if (!maxOpened || dt > maxOpened) maxOpened = dt;
-          }
-        } else {
-          // Fallback: scan every cell
-          for (const k of keys) {
-            const dt = parseToDate(rr[k]);
-            if (!dt) continue;
-            if (!minOpened || dt < minOpened) minOpened = dt;
-            if (!maxOpened || dt > maxOpened) maxOpened = dt;
-          }
+        const dt = parseToDate(rr[openedKey]);
+        if (!dt) continue;
+        if (!minOpened || dt < minOpened) minOpened = dt;
+        if (!maxOpened || dt > maxOpened) maxOpened = dt;
+      }
+    }
+
+    // 3) Final absolute fallback – scan everything
+    if ((!minOpened || !maxOpened) && Array.isArray(rawRows)) {
+      for (const rr of rawRows) {
+        for (const k of Object.keys(rr)) {
+          const dt = parseToDate(rr[k]);
+          if (!dt) continue;
+          if (!minOpened || dt < minOpened) minOpened = dt;
+          if (!maxOpened || dt > maxOpened) maxOpened = dt;
         }
       }
     }
