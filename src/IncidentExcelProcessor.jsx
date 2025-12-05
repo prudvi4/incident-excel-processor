@@ -5,20 +5,20 @@ import ExcelJS from 'exceljs/dist/exceljs.min.js';
 import { saveAs } from 'file-saver';
 
 /**
- * Incident Excel Processor (robust title detection + header tweaks)
- * - Uses XLSX for parsing/preview
- * - Uses ExcelJS to build the downloadable workbook (styled + autofit)
+ * Incident Excel Processor
  *
- * Changes:
- * - Removed the word "TimeStamp" from all headers:
- *      "Opened Date TimeStamp" -> "Opened Date"
- *      "1st Updated TimeStamp" -> "1st Updated" etc.
- * - Center aligned SLA columns (Made SLA 1, Made SLA 2, ..., Made SLA) in sheet1.
- * - Compliance and Credit sheet title now:
- *      "Compliance and Credit - <Min Opened Date> to <Max Opened Date>"
- *   where min/max are taken from the sheet's Opened dates
- *   (first from processed rows, then fallback to raw cells if needed).
- * - "% for Within SLA" = (Within SLA for that priority) / (Total incidents across all priorities)
+ * Sheet 1: Incident Intervals
+ *   Number, Priority, State, Opened Date
+ *   1st Updated, 2nd Updated, ...
+ *   Interval 1..N
+ *   Made SLA 1..N, Made SLA
+ *
+ * Sheet 2: Compliance and Credit
+ *   Title row: "Compliance and Credit - <Min Opened Date> to <Max Opened Date>"
+ *   Priority/SLA, Total Incident, Within SLA, % for Within SLA,
+ *   Exceeding SLA, Compliance and Credit
+ *
+ * % for Within SLA = Within SLA for that priority / TOTAL incidents.
  */
 
 export default function IncidentExcelProcessor(props) {
@@ -142,10 +142,10 @@ export default function IncidentExcelProcessor(props) {
       if (d && !isNaN(d)) return d;
     }
     const s = String(val).trim();
-    // try Date.parse first (ISO-like)
+    // Try native parser first (handles ISO etc.)
     const p = Date.parse(s);
     if (!isNaN(p)) return new Date(p);
-    // try dd/mm/yyyy hh:mm[:ss] AM/PM
+    // dd/mm/yyyy or dd-mm-yyyy with time and AM/PM
     const re =
       /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})[ ,T](\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?$/;
     const m = s.match(re);
@@ -244,9 +244,11 @@ export default function IncidentExcelProcessor(props) {
     return 8 * 3600 * 1000;
   }
 
-  // MAIN: processRows builds headers + rows; SLA columns use stable keys like "Made SLA X"
+  // MAIN: processRows builds headers + rows
   function processRows(rows) {
-    if (!rows || rows.length === 0) return { headers: [], data: [] };
+    if (!rows || rows.length === 0)
+      return { headers: [], data: [] };
+
     const allKeys = Object.keys(rows[0]);
     const keyNumber = normalizeKey(allKeys, 'Number') || 'Number';
     const keyPriority = normalizeKey(allKeys, 'Priority') || 'Priority';
@@ -284,12 +286,14 @@ export default function IncidentExcelProcessor(props) {
 
     const outRows = [];
     let maxUpdates = 0;
+
     for (const [num, info] of Object.entries(groups)) {
       let openedDate = null;
       for (const cand of info.openedCandidates) {
         const d = parseToDate(cand);
         if (d && (!openedDate || d < openedDate)) openedDate = d;
       }
+
       const parsedUpdates = info.updatedCandidates
         .map((u) => ({ raw: u, d: parseToDate(u) }))
         .sort((a, b) => {
@@ -298,12 +302,20 @@ export default function IncidentExcelProcessor(props) {
           if (b.d) return 1;
           return String(a.raw).localeCompare(String(b.raw));
         });
+
       const updatesRaw = parsedUpdates.map((p) => ({ raw: p.raw, date: p.d }));
       if (updatesRaw.length > maxUpdates) maxUpdates = updatesRaw.length;
-      outRows.push({ number: num, priority: info.priority, state: info.state, openedDate, updates: updatesRaw });
+
+      outRows.push({
+        number: num,
+        priority: info.priority,
+        state: info.state,
+        openedDate,
+        updates: updatesRaw,
+      });
     }
 
-    // Build headers: stable SLA keys (Made SLA X). Add final "Made SLA"
+    // Build headers (no "TimeStamp")
     const headers = ['Number', 'Priority', 'State', 'Opened Date'];
     for (let i = 0; i < maxUpdates; i++) {
       const updCol = `${i + 1}${getOrdinalSuffix(i + 1)} Updated`;
@@ -311,9 +323,8 @@ export default function IncidentExcelProcessor(props) {
       const slaCol = `Made SLA ${i + 1}`;
       headers.push(updCol, intervalCol, slaCol);
     }
-    headers.push('Made SLA'); // final aggregate column
+    headers.push('Made SLA');
 
-    // Build data rows
     const data = outRows.map((r) => {
       const row = {
         Number: r.number,
@@ -323,7 +334,7 @@ export default function IncidentExcelProcessor(props) {
       };
 
       const thrMs = priorityThresholdMs(r.priority);
-      const slaValues = []; // collect 'Y'/'N' for each interval
+      const slaValues = [];
 
       for (let i = 0; i < maxUpdates; i++) {
         const upd = r.updates[i];
@@ -350,7 +361,6 @@ export default function IncidentExcelProcessor(props) {
         }
       }
 
-      // compute final Made SLA:
       if (slaValues.length === 0) {
         row['Made SLA'] = '';
       } else if (slaValues.every((v) => v === 'Y')) {
@@ -404,7 +414,7 @@ export default function IncidentExcelProcessor(props) {
     reader.readAsArrayBuffer(inputFile);
   }
 
-  // Build workbook for download using ExcelJS and compute column widths for sheet2 (autofit)
+  // Build workbook for download
   async function buildWorkbookExcelJS(headers, rows, rawRows) {
     const wb = new ExcelJS.Workbook();
     wb.creator = 'ERPA';
@@ -413,15 +423,13 @@ export default function IncidentExcelProcessor(props) {
     // -------- Incident Intervals sheet --------
     const sheet1 = wb.addWorksheet('Incident Intervals');
 
-    // Header
     sheet1.addRow(headers);
-    // keep date detection by header names containing Opened or Updated
+
     const dateColsIdx = headers
       .map((h, i) => ({ h, i }))
       .filter((x) => /Opened|Updated/i.test(x.h))
       .map((x) => x.i + 1);
 
-    // Data rows
     for (const r of rows) {
       const rowVals = headers.map((h) => {
         const v = r[h];
@@ -435,31 +443,37 @@ export default function IncidentExcelProcessor(props) {
       sheet1.addRow(rowVals);
     }
 
-    // header styling
     const headerRow1 = sheet1.getRow(1);
     headerRow1.alignment = { horizontal: 'center', vertical: 'middle' };
     headerRow1.font = { bold: true };
 
-    // auto width (approx) for sheet1
+    // Auto width
     sheet1.columns = headers.map((h, colIdx) => {
       let maxLen = String(h || '').length;
       for (let r = 2; r <= sheet1.rowCount; r++) {
         const cell = sheet1.getRow(r).getCell(colIdx + 1);
-        const txt = cell.value instanceof Date ? formatShortDate(cell.value) : cell.value ?? '';
+        let txt;
+        if (cell.value instanceof Date) {
+          // approximate real display: dd-mm-yyyy hh:mm AM/PM
+          txt = 'dd-mm-yyyy hh:mm AM/PM';
+        } else {
+          txt = cell.value ?? '';
+        }
         const l = String(txt).length;
         if (l > maxLen) maxLen = l;
       }
-      const w = Math.min(50, Math.max(10, maxLen + 2));
+      let w = Math.min(60, Math.max(10, maxLen + 2));
       return { header: h, width: w };
     });
 
-    // format date columns on sheet1
+    // Format date columns and ensure they are wide enough (avoid #######)
     for (const c of dateColsIdx) {
       const col = sheet1.getColumn(c);
       col.numFmt = 'dd-mm-yyyy hh:mm AM/PM';
+      if (!col.width || col.width < 22) col.width = 22;
     }
 
-    // Center align SLA columns (Made SLA 1..N and Made SLA)
+    // Center SLA columns in sheet1
     headers.forEach((h, idx) => {
       if (/^Made SLA \d+$/.test(h) || h === 'Made SLA') {
         const col = sheet1.getColumn(idx + 1);
@@ -472,28 +486,25 @@ export default function IncidentExcelProcessor(props) {
     // -------- Compliance and Credit sheet --------
     const sheet2 = wb.addWorksheet('Compliance and Credit');
 
-    // Get Opened date range for title:
-    // 1) from processed rows' "Opened Date"
-    // 2) fallback: scan all raw cells for any date-like value
+    // Compute min/max Opened Date from RAW rows, using "Opened"/"Opened Date" column
     let minOpened = null;
     let maxOpened = null;
 
-    if (Array.isArray(rows)) {
-      for (const r of rows) {
-        const dt = parseToDate(r['Opened Date']);
-        if (dt) {
-          if (!minOpened || dt < minOpened) minOpened = dt;
-          if (!maxOpened || dt > maxOpened) maxOpened = dt;
-        }
-      }
-    }
-
-    if ((!minOpened || !maxOpened) && Array.isArray(rawRows)) {
-      for (const rawRow of rawRows) {
-        for (const k of Object.keys(rawRow)) {
-          const val = rawRow[k];
-          const dt = parseToDate(val);
+    if (Array.isArray(rawRows)) {
+      for (const rr of rawRows) {
+        const keys = Object.keys(rr);
+        const openedKey = normalizeKey(keys, 'Opened');
+        if (openedKey) {
+          const dt = parseToDate(rr[openedKey]);
           if (dt) {
+            if (!minOpened || dt < minOpened) minOpened = dt;
+            if (!maxOpened || dt > maxOpened) maxOpened = dt;
+          }
+        } else {
+          // Fallback: scan every cell
+          for (const k of keys) {
+            const dt = parseToDate(rr[k]);
+            if (!dt) continue;
             if (!minOpened || dt < minOpened) minOpened = dt;
             if (!maxOpened || dt > maxOpened) maxOpened = dt;
           }
@@ -536,10 +547,8 @@ export default function IncidentExcelProcessor(props) {
       { Y: 0, N: 0, total: 0 }
     );
 
-    // Build content array we will write to the sheet (so we can compute widths)
     const compAOA = [];
-    // placeholder for title row (we will explicitly set A1 after merging)
-    compAOA.push(['', '', '', '', '', '']);
+    compAOA.push(['', '', '', '', '', '']); // title placeholder
     compAOA.push([
       'Priority/SLA',
       'Total Incident',
@@ -549,20 +558,17 @@ export default function IncidentExcelProcessor(props) {
       'Compliance and Credit',
     ]);
 
-    // Calculate per-priority percent: (Within SLA for priority) / (TOTAL incidents across all priorities) * 100
+    // Per-priority % = Within SLA for that priority / TOTAL incidents
     for (const p of priorities) {
       const { Y, N, total } = countsByPriority[p];
       let pctNum = 0;
       let pctDisplay = '';
+
       if (totals.total > 0) {
         pctNum = (Y / totals.total) * 100;
         pctDisplay = `${pctNum.toFixed(1)}%`;
-      } else {
-        pctNum = 0;
-        pctDisplay = '';
       }
 
-      // Compliance flag: if %WithinSLA < 95% then 'Y' else 'N' (only for P1,P2 — others blank)
       const flag =
         (p.startsWith('P1') || p.startsWith('P2')) && totals.total > 0
           ? pctNum < 95
@@ -573,41 +579,36 @@ export default function IncidentExcelProcessor(props) {
       compAOA.push([p, total, Y, pctDisplay, N, flag]);
     }
 
-    // Totals row: counts plus overall percent = (total within SLA / total incidents) * 100
     let overallPctNum = 0;
     if (totals.total > 0) overallPctNum = (totals.Y / totals.total) * 100;
     const totalPctDisplay = `${overallPctNum.toFixed(1)}%`;
     compAOA.push(['Total', totals.total, totals.Y, totalPctDisplay, totals.N, '']);
 
-    // Write compAOA to sheet2
     for (let r = 0; r < compAOA.length; r++) {
-      const rowVals = compAOA[r];
-      sheet2.addRow(rowVals);
+      sheet2.addRow(compAOA[r]);
     }
 
-    // Merge title row A1:F1 and explicitly set A1 value so Excel displays the title
+    // Title row
     sheet2.mergeCells(1, 1, 1, 6);
     const titleCell = sheet2.getCell('A1');
     titleCell.value = titleText;
     titleCell.alignment = { vertical: 'middle', horizontal: 'center' };
     titleCell.font = { bold: true };
 
-    // Center align and bold header row (row 2), set row heights
+    // Row styling & centering
     for (let r = 1; r <= sheet2.rowCount; r++) {
       const row = sheet2.getRow(r);
       row.height = 18;
       if (r === 2) {
         row.alignment = { vertical: 'middle', horizontal: 'center' };
         row.font = { bold: true };
-      } else if (r === 1) {
-        // title already styled
-      } else {
+      } else if (r > 2) {
         row.alignment = { vertical: 'middle', horizontal: 'center' };
         row.font = { bold: false };
       }
     }
 
-    // AUTOFIT: compute max length per column (header + all rows), set width = min(40, maxLen + 4)
+    // Auto width for sheet2
     const colCount = 6;
     const colWidths = new Array(colCount).fill(10);
     for (let c = 0; c < colCount; c++) {
@@ -620,11 +621,8 @@ export default function IncidentExcelProcessor(props) {
       const width = Math.min(40, Math.max(10, maxLen + 4));
       colWidths[c] = width;
     }
-
-    // explicitly ensure "Compliance and Credit" column (column F / index 5) is sized to its content
     colWidths[5] = Math.max(colWidths[5], 12);
 
-    // assign widths
     sheet2.columns = [
       { header: 'Priority/SLA', width: colWidths[0] },
       { header: 'Total Incident', width: colWidths[1] },
@@ -634,7 +632,6 @@ export default function IncidentExcelProcessor(props) {
       { header: 'Compliance and Credit', width: colWidths[5] },
     ];
 
-    // freeze top rows (title + header)
     sheet2.views = [{ state: 'frozen', ySplit: 2 }];
 
     return wb;
@@ -665,7 +662,8 @@ export default function IncidentExcelProcessor(props) {
         const blob = new Blob([buf], {
           type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         });
-        const outFileName = (fileName || 'output.xlsx').replace(/\.xlsx$/i, '') + '-processed.xlsx';
+        const outFileName = (fileName || 'output.xlsx')
+          .replace(/\.xlsx$/i, '') + '-processed.xlsx';
         saveAs(blob, outFileName);
 
         setMessage(`Downloaded: ${outFileName}`);
@@ -685,7 +683,7 @@ export default function IncidentExcelProcessor(props) {
     reader.readAsArrayBuffer(inputFile);
   }
 
-  // Filtering & sorting memo (unchanged)
+  // Filtering & sorting memo (unchanged UI logic)
   const filteredAndSortedRows = useMemo(() => {
     if (!allRows || allRows.length === 0) return [];
     let rows = allRows;
@@ -1095,7 +1093,7 @@ export default function IncidentExcelProcessor(props) {
             <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
               <div style={{ fontSize: 12, color: '#334155' }}>File type</div>
               <div style={{ fontSize: 12, color: '#0f172a', fontWeight: 600 }}>
-                Only .xlsx — Shortcut: Ctrl/Cmd+K
+                Only .xlsx  —  Shortcut: Ctrl/Cmd+K
               </div>
             </div>
           </div>
