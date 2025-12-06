@@ -1125,7 +1125,7 @@ export default function IncidentExcelProcessor(props) {
         >
           <div style={{ fontSize: 13 }}>ERPA</div>
           <div style={{ fontSize: 12, opacity: 0.9 }}>
-            Snow Data Incident Excel Processors
+            Snow Data Incident Excel Processor
           </div>
         </div>
       </div>
