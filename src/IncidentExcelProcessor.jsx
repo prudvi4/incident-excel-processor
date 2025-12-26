@@ -415,226 +415,142 @@ export default function IncidentExcelProcessor(props) {
   }
 
   // Build workbook for download
-  async function buildWorkbookExcelJS(headers, rows, rawRows) {
-    const wb = new ExcelJS.Workbook();
-    wb.creator = 'ERPA';
-    wb.created = new Date();
+// Build workbook for download
+async function buildWorkbookExcelJS(headers, rows, rawRows) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'ERPA';
+  wb.created = new Date();
 
-    // -------- Incident Intervals sheet --------
-    const sheet1 = wb.addWorksheet('Incident Intervals');
+  /* =========================
+     SHEET 1 – Incident Intervals
+     (UNCHANGED – timestamps preserved as text)
+  ========================== */
+  const sheet1 = wb.addWorksheet('Incident Intervals');
+  sheet1.addRow(headers);
 
-    // Header row
-    sheet1.addRow(headers);
+  for (const r of rows) {
+    sheet1.addRow(headers.map(h => r[h] ?? null));
+  }
 
-    // Determine SLA columns (for centering)
-    const slaColIdx = headers
-      .map((h, i) => ({ h, i }))
-      .filter((x) => /^Made SLA \d+$/.test(x.h) || x.h === 'Made SLA')
-      .map((x) => x.i + 1);
+  sheet1.getRow(1).font = { bold: true };
+  sheet1.views = [{ state: 'frozen', ySplit: 1 }];
 
-    // Data rows – IMPORTANT: keep date/time as TEXT, no Date objects → avoids timezone shift
-    for (const r of rows) {
-      const rowVals = headers.map((h) => {
-        const v = r[h];
-        if (v == null || v === '') return null;
-        return v; // always write as-is (string/number)
-      });
-      sheet1.addRow(rowVals);
+  /* =========================
+     SHEET 2 – Compliance and Credit
+  ========================== */
+  const sheet2 = wb.addWorksheet('Compliance and Credit');
+
+  /* ---- TITLE (NO DATE RANGE) ---- */
+  sheet2.addRow(['Compliance and Credit']);
+  sheet2.mergeCells(1, 1, 1, 8);
+  sheet2.getRow(1).font = { bold: true };
+  sheet2.getRow(1).alignment = { horizontal: 'center' };
+
+  /* ---- HEADERS ---- */
+  sheet2.addRow([
+    'Priority/SLA',
+    'Total Incident',
+    'Within SLA',
+    '% for Within SLA',
+    'Breach',
+    'Breach %',
+    'Compliance',
+    'Credit',
+  ]);
+
+  sheet2.getRow(2).font = { bold: true };
+  sheet2.views = [{ state: 'frozen', ySplit: 2 }];
+
+  /* ---- COUNT DATA ---- */
+  const priorities = ['P1 - Critical', 'P2 - High', 'P3 - Medium', 'P4 - Low'];
+  const stats = {};
+  priorities.forEach(p => (stats[p] = { total: 0, Y: 0, N: 0 }));
+
+  rows.forEach(r => {
+    const pr = r.Priority || '';
+    const key = priorities.find(p => pr.startsWith(p.split(' ')[0]));
+    if (!key) return;
+
+    stats[key].total++;
+    if (r['Made SLA'] === 'Y') stats[key].Y++;
+    if (r['Made SLA'] === 'N') stats[key].N++;
+  });
+
+  const grandTotal = Object.values(stats).reduce((s, x) => s + x.total, 0);
+
+  /* ---- DATA ROWS ---- */
+  priorities.forEach(p => {
+    const { total, Y, N } = stats[p];
+
+    // N/A CASE
+    if (total === 0) {
+      const row = sheet2.addRow([
+        p, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'Y', '0.0%'
+      ]);
+
+      // GREEN credit
+      row.getCell(8).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF92D050' },
+      };
+      return;
     }
 
-    const headerRow1 = sheet1.getRow(1);
-    headerRow1.alignment = { horizontal: 'center', vertical: 'middle' };
-    headerRow1.font = { bold: true };
+    const withinPct = ((Y / total) * 100).toFixed(1) + '%';
 
-    // Auto width for sheet1
-    sheet1.columns = headers.map((h, colIdx) => {
-      let maxLen = String(h || '').length;
-      for (let r = 2; r <= sheet1.rowCount; r++) {
-        const cell = sheet1.getRow(r).getCell(colIdx + 1);
-        const txt = cell.value != null ? String(cell.value) : '';
-        const l = txt.length;
-        if (l > maxLen) maxLen = l;
-      }
-      const w = Math.min(60, Math.max(12, maxLen + 2));
-      return { header: h, width: w };
-    });
+    // ✅ FIXED: Breach % based on TOTAL incidents (108)
+    const breachPct =
+      grandTotal > 0 ? ((N / grandTotal) * 100).toFixed(1) + '%' : '0.0%';
 
-    // Center SLA columns in sheet1
-    for (const c of slaColIdx) {
-      const col = sheet1.getColumn(c);
-      col.alignment = { horizontal: 'center', vertical: 'middle' };
-    }
+    let compliance = 'Y';
+    if ((p.startsWith('P1') || p.startsWith('P2')) && N > 0) compliance = 'N';
 
-    sheet1.views = [{ state: 'frozen', ySplit: 1 }];
+    let credit = '0.0%';
+    if (p.startsWith('P1') && compliance === 'N') credit = '1.0%';
+    if (p.startsWith('P2') && compliance === 'N') credit = '0.50%';
 
-    // -------- Compliance and Credit sheet --------
-    const sheet2 = wb.addWorksheet('Compliance and Credit');
-
-    // 1) Try to get min/max from processed "Opened Date" column (rows param)
-    let minOpened = null;
-    let maxOpened = null;
-
-    if (Array.isArray(rows)) {
-      for (const r of rows) {
-        const dt = parseToDate(r['Opened Date']);
-        if (!dt) continue;
-        if (!minOpened || dt < minOpened) minOpened = dt;
-        if (!maxOpened || dt > maxOpened) maxOpened = dt;
-      }
-    }
-
-    // 2) If still not found, fall back to rawRows.Opened (very defensive)
-    if ((!minOpened || !maxOpened) && Array.isArray(rawRows) && rawRows.length > 0) {
-      const firstKeys = Object.keys(rawRows[0]);
-      const openedKey =
-        firstKeys.find(
-          (k) => k.toLowerCase().replace(/[^a-z0-9]/g, '') === 'opened'
-        ) || 'Opened';
-
-      for (const rr of rawRows) {
-        const dt = parseToDate(rr[openedKey]);
-        if (!dt) continue;
-        if (!minOpened || dt < minOpened) minOpened = dt;
-        if (!maxOpened || dt > maxOpened) maxOpened = dt;
-      }
-    }
-
-    // 3) Final absolute fallback – scan everything
-    if ((!minOpened || !maxOpened) && Array.isArray(rawRows)) {
-      for (const rr of rawRows) {
-        for (const k of Object.keys(rr)) {
-          const dt = parseToDate(rr[k]);
-          if (!dt) continue;
-          if (!minOpened || dt < minOpened) minOpened = dt;
-          if (!maxOpened || dt > maxOpened) maxOpened = dt;
-        }
-      }
-    }
-
-    const titleText =
-      minOpened && maxOpened
-        ? `Compliance and Credit - ${formatShortDate(minOpened)} to ${formatShortDate(
-            maxOpened
-          )}`
-        : 'Compliance and Credit';
-
-    // Build priority counts from processed rows
-    const priorities = ['P1 - Critical', 'P2 - High', 'P3 - Medium', 'P4 - Low'];
-    const countsByPriority = {};
-    for (const p of priorities) countsByPriority[p] = { Y: 0, N: 0, total: 0 };
-
-    for (const r of rows) {
-      const pr = (r['Priority'] || '').toString().trim();
-      const key = priorities.find((pp) =>
-        pr.toUpperCase().startsWith(pp.split(' ')[0].toUpperCase())
-      );
-      if (key) {
-        countsByPriority[key].total++;
-        const within = String(r['Made SLA'] || '').trim().toUpperCase();
-        if (within === 'Y') countsByPriority[key].Y++;
-        else if (within === 'N') countsByPriority[key].N++;
-      }
-    }
-
-    const totals = priorities.reduce(
-      (acc, p) => {
-        acc.Y += countsByPriority[p].Y;
-        acc.N += countsByPriority[p].N;
-        acc.total += countsByPriority[p].total;
-        return acc;
-      },
-      { Y: 0, N: 0, total: 0 }
-    );
-
-    const compAOA = [];
-    compAOA.push(['', '', '', '', '', '']); // title placeholder
-    compAOA.push([
-      'Priority/SLA',
-      'Total Incident',
-      'Within SLA',
-      '% for Within SLA',
-      'Exceeding SLA',
-      'Compliance and Credit',
+    const row = sheet2.addRow([
+      p,
+      total,
+      Y,
+      withinPct,
+      N,
+      breachPct,
+      compliance,
+      credit,
     ]);
 
-    // Per-priority % = Within SLA for that priority / TOTAL incidents
-    for (const p of priorities) {
-      const { Y, N, total } = countsByPriority[p];
-      let pctNum = 0;
-      let pctDisplay = '';
+    /* ---- CREDIT CELL COLOR ---- */
+    row.getCell(8).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: credit === '0.0%' ? 'FF92D050' : 'FFFF0000' },
+    };
+  });
 
-      if (totals.total > 0) {
-        pctNum = (Y / totals.total) * 100;
-        pctDisplay = `${pctNum.toFixed(1)}%`;
-      }
+  /* ---- TOTAL ROW ---- */
+  const totalY = Object.values(stats).reduce((s, x) => s + x.Y, 0);
+  const totalN = Object.values(stats).reduce((s, x) => s + x.N, 0);
 
-      const flag =
-        (p.startsWith('P1') || p.startsWith('P2')) && totals.total > 0
-          ? pctNum < 95
-            ? 'Y'
-            : 'N'
-          : '';
+  sheet2.addRow([
+    'Total',
+    grandTotal,
+    totalY,
+    ((totalY / grandTotal) * 100).toFixed(1) + '%',
+    totalN,
+    '100%',
+    '',
+    '',
+  ]);
 
-      compAOA.push([p, total, Y, pctDisplay, N, flag]);
-    }
+  /* ---- COLUMN WIDTHS ---- */
+  sheet2.columns.forEach(col => (col.width = 18));
 
-    let overallPctNum = 0;
-    if (totals.total > 0) overallPctNum = (totals.Y / totals.total) * 100;
-    const totalPctDisplay = `${overallPctNum.toFixed(1)}%`;
-    compAOA.push(['Total', totals.total, totals.Y, totalPctDisplay, totals.N, '']);
+  return wb;
+}
 
-    for (let r = 0; r < compAOA.length; r++) {
-      sheet2.addRow(compAOA[r]);
-    }
 
-    // Title row
-    sheet2.mergeCells(1, 1, 1, 6);
-    const titleCell = sheet2.getCell('A1');
-    titleCell.value = titleText;
-    titleCell.alignment = { vertical: 'middle', horizontal: 'center' };
-    titleCell.font = { bold: true };
-
-    // Row styling & centering
-    for (let r = 1; r <= sheet2.rowCount; r++) {
-      const row = sheet2.getRow(r);
-      row.height = 18;
-      if (r === 2) {
-        row.alignment = { vertical: 'middle', horizontal: 'center' };
-        row.font = { bold: true };
-      } else if (r > 2) {
-        row.alignment = { vertical: 'middle', horizontal: 'center' };
-        row.font = { bold: false };
-      }
-    }
-
-    // Auto width for sheet2
-    const colCount = 6;
-    const colWidths = new Array(colCount).fill(10);
-    for (let c = 0; c < colCount; c++) {
-      let maxLen = 0;
-      for (let r = 0; r < compAOA.length; r++) {
-        const cellValue = compAOA[r][c] != null ? compAOA[r][c] : '';
-        const txt = String(cellValue);
-        if (txt.length > maxLen) maxLen = txt.length;
-      }
-      const width = Math.min(40, Math.max(10, maxLen + 4));
-      colWidths[c] = width;
-    }
-    colWidths[5] = Math.max(colWidths[5], 12);
-
-    sheet2.columns = [
-      { header: 'Priority/SLA', width: colWidths[0] },
-      { header: 'Total Incident', width: colWidths[1] },
-      { header: 'Within SLA', width: colWidths[2] },
-      { header: '% for Within SLA', width: colWidths[3] },
-      { header: 'Exceeding SLA', width: colWidths[4] },
-      { header: 'Compliance and Credit', width: colWidths[5] },
-    ];
-
-    sheet2.views = [{ state: 'frozen', ySplit: 2 }];
-
-    return wb;
-  }
 
   // DOWNLOAD
   async function handleDownload() {
