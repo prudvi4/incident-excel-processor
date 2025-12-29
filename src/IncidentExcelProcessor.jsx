@@ -422,8 +422,7 @@ async function buildWorkbookExcelJS(headers, rows, rawRows) {
   wb.created = new Date();
 
   /* =========================
-     SHEET 1 – Incident Intervals
-     (UNCHANGED – timestamps preserved as text)
+     SHEET 1 – Incident Intervals (UNCHANGED)
   ========================== */
   const sheet1 = wb.addWorksheet('Incident Intervals');
   sheet1.addRow(headers);
@@ -436,29 +435,38 @@ async function buildWorkbookExcelJS(headers, rows, rawRows) {
   sheet1.views = [{ state: 'frozen', ySplit: 1 }];
 
   /* =========================
-     SHEET 2 – Compliance and Credit
+     SHEET 2 – SUI SLA
   ========================== */
-  const sheet2 = wb.addWorksheet('Compliance and Credit');
+  const sheet2 = wb.addWorksheet('SUI SLA');
 
-  /* ---- TITLE (NO DATE RANGE) ---- */
-  sheet2.addRow(['Compliance and Credit']);
-  sheet2.mergeCells(1, 1, 1, 8);
+  /* ---- TITLE ---- */
+  sheet2.addRow(['SUI SLA']);
+  sheet2.mergeCells(1, 1, 1, 9);
   sheet2.getRow(1).font = { bold: true };
   sheet2.getRow(1).alignment = { horizontal: 'center' };
 
   /* ---- HEADERS ---- */
-  sheet2.addRow([
-    'Priority/SLA',
-    'Total Incident',
-    'Within SLA',
-    '% for Within SLA',
-    'Breach',
-    'Breach %',
-    'Compliance',
-    'Credit',
-  ]);
+  const headerRow = sheet2.addRow([
+  'Priority/SLA',
+  'Total Incident',
+  'Within SLA',
+  '% for Within SLA',
+  'Breach',
+  'Breach %',
+  'Compliance',
+  'Credit',
+  'Credit $',
+]);
 
-  sheet2.getRow(2).font = { bold: true };
+headerRow.font = { bold: true };
+
+// Header alignment FIX
+[2,3, 4, 5, 6, 8, 9].forEach(c => {
+  headerRow.getCell(c).alignment = { horizontal: 'left', vertical: 'middle' };
+});
+headerRow.getCell(8).alignment = { horizontal: 'left', vertical: 'middle' };
+headerRow.getCell(7).alignment = { horizontal: 'center', vertical: 'middle' };
+
   sheet2.views = [{ state: 'frozen', ySplit: 2 }];
 
   /* ---- COUNT DATA ---- */
@@ -470,7 +478,6 @@ async function buildWorkbookExcelJS(headers, rows, rawRows) {
     const pr = r.Priority || '';
     const key = priorities.find(p => pr.startsWith(p.split(' ')[0]));
     if (!key) return;
-
     stats[key].total++;
     if (r['Made SLA'] === 'Y') stats[key].Y++;
     if (r['Made SLA'] === 'N') stats[key].N++;
@@ -482,26 +489,18 @@ async function buildWorkbookExcelJS(headers, rows, rawRows) {
   priorities.forEach(p => {
     const { total, Y, N } = stats[p];
 
-    // N/A CASE
     if (total === 0) {
       const row = sheet2.addRow([
-        p, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'Y', '0.0%'
+        p, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'Y', '0.0%', ''
       ]);
-
-      // GREEN credit
-      row.getCell(8).fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FF92D050' },
-      };
+      styleRow(row, true);
       return;
     }
 
     const withinPct = ((Y / total) * 100).toFixed(1) + '%';
-
-    // ✅ FIXED: Breach % based on TOTAL incidents (108)
-    const breachPct =
-      grandTotal > 0 ? ((N / grandTotal) * 100).toFixed(1) + '%' : '0.0%';
+    const breachPct = grandTotal > 0
+      ? ((N / grandTotal) * 100).toFixed(1) + '%'
+      : '0.0%';
 
     let compliance = 'Y';
     if ((p.startsWith('P1') || p.startsWith('P2')) && N > 0) compliance = 'N';
@@ -519,21 +518,17 @@ async function buildWorkbookExcelJS(headers, rows, rawRows) {
       breachPct,
       compliance,
       credit,
+      '',
     ]);
 
-    /* ---- CREDIT CELL COLOR ---- */
-    row.getCell(8).fill = {
-      type: 'pattern',
-      pattern: 'solid',
-      fgColor: { argb: credit === '0.0%' ? 'FF92D050' : 'FFFF0000' },
-    };
+    styleRow(row, credit === '0.0%');
   });
 
   /* ---- TOTAL ROW ---- */
   const totalY = Object.values(stats).reduce((s, x) => s + x.Y, 0);
   const totalN = Object.values(stats).reduce((s, x) => s + x.N, 0);
 
-  sheet2.addRow([
+  const totalRow = sheet2.addRow([
     'Total',
     grandTotal,
     totalY,
@@ -542,13 +537,39 @@ async function buildWorkbookExcelJS(headers, rows, rawRows) {
     '100%',
     '',
     '',
+    '',
   ]);
+  styleRow(totalRow, true);
 
   /* ---- COLUMN WIDTHS ---- */
   sheet2.columns.forEach(col => (col.width = 18));
 
   return wb;
+
+  /* =========================
+     CELL STYLING HELPERS
+  ========================== */
+  function styleRow(row, greenCredit) {
+  // RIGHT aligned numeric / percentage columns
+  [2,3, 4, 5, 6, 8, 9].forEach(c => {
+    row.getCell(c).alignment = { horizontal: 'right', vertical: 'middle' };
+  });
+
+  // CENTER aligned Compliance column (Y / N)
+  
+  row.getCell(7).alignment = { horizontal: 'center', vertical: 'middle' };
+  row.getCell(8).alignment = { horizontal: 'left', vertical: 'middle' };
+
+  // Credit color
+  row.getCell(8).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: greenCredit ? 'FF92D050' : 'FFFF0000' },
+  };
 }
+
+}
+
 
 
 
