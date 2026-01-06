@@ -417,6 +417,7 @@ export default function IncidentExcelProcessor(props) {
   // Build workbook for download
 // Build workbook for download
 async function buildWorkbookExcelJS(headers, rows, rawRows) {
+  const CREDIT_BASE_AMOUNT = 118490;
   const wb = new ExcelJS.Workbook();
   wb.creator = 'ERPA';
   wb.created = new Date();
@@ -490,9 +491,17 @@ headerRow.getCell(7).alignment = { horizontal: 'center', vertical: 'middle' };
     const { total, Y, N } = stats[p];
 
     if (total === 0) {
-      const row = sheet2.addRow([
-        p, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'Y', '0.0%', ''
-      ]);
+  const row = sheet2.addRow([
+    p,
+    'N/A',
+    'N/A',
+    'N/A',
+    'N/A',
+    'N/A',
+    'Y',
+    '0.0%',
+    'N/A'
+  ]);
       styleRow(row, true);
       return;
     }
@@ -509,17 +518,27 @@ headerRow.getCell(7).alignment = { horizontal: 'center', vertical: 'middle' };
     if (p.startsWith('P1') && compliance === 'N') credit = '1.0%';
     if (p.startsWith('P2') && compliance === 'N') credit = '0.50%';
 
-    const row = sheet2.addRow([
-      p,
-      total,
-      Y,
-      withinPct,
-      N,
-      breachPct,
-      compliance,
-      credit,
-      '',
-    ]);
+  // ---- Credit $ calculation ----
+const breachPctNum = parseFloat(breachPct.replace('%', '')); // numeric %
+const creditPctNum = parseFloat(credit.replace('%', ''));   // numeric %
+
+let creditDollar = 0;
+if (breachPctNum < 95) {
+  creditDollar = (creditPctNum / 100) * CREDIT_BASE_AMOUNT;
+}
+
+const row = sheet2.addRow([
+  p,
+  total,
+  Y,
+  withinPct,
+  N,
+  breachPct,
+  compliance,
+  credit,
+  creditDollar > 0 ? `$ ${creditDollar.toFixed(2)}` : '$ 0.00',
+]);
+
 
     styleRow(row, credit === '0.0%');
   });
@@ -551,9 +570,11 @@ headerRow.getCell(7).alignment = { horizontal: 'center', vertical: 'middle' };
   ========================== */
   function styleRow(row, greenCredit) {
   // RIGHT aligned numeric / percentage columns
-  [2,3, 4, 5, 6, 8, 9].forEach(c => {
+  [2,3, 4, 5, 6, 8].forEach(c => {
     row.getCell(c).alignment = { horizontal: 'right', vertical: 'middle' };
   });
+
+  row.getCell(9).alignment = { horizontal: 'left', vertical: 'middle' };
 
   // CENTER aligned Compliance column (Y / N)
   
